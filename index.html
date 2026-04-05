@@ -1,0 +1,523 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Railway Signal Violation Dashboard v19</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css" />
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+    <script src="https://unpkg.com/leaflet-image@0.4.0/leaflet-image.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+    
+    <link rel="stylesheet" href="style.css" />
+</head>
+<body class="p-6">
+
+    <!-- Demotion toast notification -->
+    <div id="demotionToast">
+        <div class="toast-header">
+            <span class="toast-title">✅ Moved to Complied</span>
+            <button class="toast-close" onclick="closeDemotionToast()">✕</button>
+        </div>
+        <div class="toast-body" id="demotionToastBody"></div>
+        <div class="toast-footer">
+            <span id="demotionToastLabel">Auto-closing in <span id="demotionToastSecs">8</span>s</span>
+            <div class="toast-progress"><div class="toast-progress-bar" id="demotionToastBar" style="width:100%"></div></div>
+        </div>
+    </div>
+
+    <div class="max-w-7xl mx-auto">
+        <h1 class="text-3xl font-bold text-gray-800 mb-1">🚄 Railway Signal Violation Dashboard</h1>
+        <p class="text-xs text-gray-400 mb-6">v19 — Ambiguous tooltip · Draggable violation panel · Pre-upload RTIS graph · Per-sec smart filters (time↔station)</p>
+
+        <!-- Configuration & Inputs -->
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+            
+            <!-- File Inputs -->
+            <div class="card md:col-span-2">
+                <h3 class="font-bold text-lg mb-4 border-b pb-2">1. Load Data Sources (CSV)</h3>
+                
+                <!-- Drag & Drop Area -->
+                <div id="dropZone" class="border-2 border-dashed border-gray-300 rounded-lg p-8 text-center bg-gray-50 hover:bg-gray-100 transition cursor-pointer mb-4">
+                    <svg class="mx-auto h-12 w-12 text-gray-400" stroke="currentColor" fill="none" viewBox="0 0 48 48">
+                        <path d="M28 8H12a4 4 0 00-4 4v20m32-12v8m0 0v8a4 4 0 01-4 4H12a4 4 0 01-4-4v-4m32-4l-3.172-3.172a4 4 0 00-5.656 0L28 28M8 32l9.172-9.172a4 4 0 015.656 0L28 28m0 0l4 4m4-24h8m-4-4v8m-12 4h.02" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+                    </svg>
+                    <p class="mt-2 text-sm text-gray-600">
+                        <span class="font-semibold">Drop CSV / XLSX files here</span> or click to browse
+                    </p>
+                    <p class="mt-1 text-xs text-gray-500">Upload RTIS, SNT, and FSD files in any order &nbsp;·&nbsp; SNT accepts multiple XLSX files (merged)</p>
+                    <input type="file" id="fileInput" accept=".csv,.xlsx,.xls" multiple class="hidden" />
+                </div>
+
+                <!-- Status Badges -->
+                <div class="grid grid-cols-3 gap-3">
+                    <div class="border rounded p-3 text-center" id="status-rtis-card">
+                        <div class="text-xs font-medium text-gray-500 mb-1">RTIS Data</div>
+                        <div id="status-rtis" class="text-sm font-bold text-gray-400">❌ Not Loaded</div>
+                        <div id="file-rtis-name" class="text-xs text-gray-400 mt-1 truncate"></div>
+                    </div>
+                    <div class="border rounded p-3 text-center" id="status-snt-card">
+                        <div class="text-xs font-medium text-gray-500 mb-1">Signal Log (SNT)</div>
+                        <div id="status-snt" class="text-sm font-bold text-gray-400">❌ Not Loaded</div>
+                        <div id="file-snt-name" class="text-xs text-gray-400 mt-1 truncate"></div>
+                    </div>
+                    <div class="border rounded p-3 text-center" id="status-fsd-card">
+                        <div class="text-xs font-medium text-gray-500 mb-1">FSD Master</div>
+                        <div id="status-fsd" class="text-sm font-bold text-gray-400">❌ Not Loaded</div>
+                        <div id="file-fsd-name" class="text-xs text-gray-400 mt-1 truncate"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Parameters -->
+            <div class="card">
+                <h3 class="font-bold text-lg mb-4 border-b pb-2">2. Configuration</h3>
+                <div class="space-y-3">
+                    <div>
+                        <label class="block text-sm font-medium">Time Window (seconds)</label>
+                        <input type="number" id="inputTimeWindow" value="120" class="w-full border rounded p-2" title="Train must pass 0-120 seconds BEFORE signal event">
+                        <p class="text-xs text-gray-500 mt-1">Train passes first, then signal logs</p>
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium">Speed Limit (km/h)</label>
+                        <input type="number" id="inputSpeedLimit" value="60" class="w-full border rounded p-2">
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium">Max Dist (km)</label>
+                        <input type="number" id="inputMaxDist" value="0.2" step="0.01" class="w-full border rounded p-2">
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium">FSD Dist Threshold (m)
+                            <span title="Per-sec: if train GPS at SNT time is farther than this from the FSD signal, row is moved to Complied" style="cursor:help;color:#9ca3af;font-size:0.75rem"> ⓘ</span>
+                        </label>
+                        <input type="number" id="inputFsdThreshold" value="100" min="0" step="10" class="w-full border rounded p-2">
+                        <p class="text-xs text-gray-500 mt-1">Demote to Complied if &gt; this distance</p>
+                    </div>
+                    <button onclick="runAnalysis()" id="btnRun" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded mt-2 disabled:bg-gray-400">
+                        Run Analysis
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Data Validation Panel -->
+        <div id="validationPanel" class="card mt-6 hidden">
+            <h3 class="font-bold text-lg mb-4 border-b pb-2 flex items-center">
+                <span class="mr-2">📊</span> Data Validation Report
+            </h3>
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                <!-- RTIS Validation -->
+                <div class="border rounded p-4">
+                    <h4 class="font-semibold text-sm mb-2 text-blue-700">RTIS Data Quality</h4>
+                    <div id="rtisValidation" class="space-y-1 text-xs"></div>
+                </div>
+                <!-- SNT Validation -->
+                <div class="border rounded p-4">
+                    <h4 class="font-semibold text-sm mb-2 text-purple-700">SNT Data Quality</h4>
+                    <div id="sntValidation" class="space-y-1 text-xs"></div>
+                </div>
+                <!-- FSD Validation -->
+                <div class="border rounded p-4">
+                    <h4 class="font-semibold text-sm mb-2 text-green-700">FSD Data Quality</h4>
+                    <div id="fsdValidation" class="space-y-1 text-xs"></div>
+                </div>
+            </div>
+            <div id="crossValidation" class="mt-4 p-3 bg-gray-50 rounded border text-xs"></div>
+        </div>
+
+        <!-- Metrics Dashboard -->
+        <div class="grid grid-cols-2 md:grid-cols-5 gap-4 mt-6 mb-6">
+            <!-- Total SNT -->
+            <div class="bg-white p-4 rounded shadow border-l-4 border-blue-500">
+                <div class="text-gray-500 text-xs uppercase font-bold">Total SNT Events</div>
+                <div id="metricTotal" class="text-2xl font-bold text-gray-800">0</div>
+            </div>
+            <!-- No Train Found -->
+            <div class="bg-white p-4 rounded shadow border-l-4 border-gray-400">
+                <div class="text-gray-500 text-xs uppercase font-bold">No Train Found</div>
+                <div id="metricNoTrain" class="text-2xl font-bold text-gray-600">0</div>
+            </div>
+            <!-- Complied -->
+            <div class="bg-white p-4 rounded shadow border-l-4 border-green-500">
+                <div class="text-gray-500 text-xs uppercase font-bold">Complied</div>
+                <div id="metricComplied" class="text-2xl font-bold text-green-600">0</div>
+            </div>
+            <!-- Ambiguous -->
+            <div class="bg-white p-4 rounded shadow border-l-4 border-yellow-500">
+                <div class="text-gray-500 text-xs uppercase font-bold">Ambiguous</div>
+                <div id="metricAmbiguous" class="text-2xl font-bold text-yellow-600">0</div>
+            </div>
+            <!-- Violations -->
+            <div class="bg-white p-4 rounded shadow border-l-4 border-red-500">
+                <div class="text-gray-500 text-xs uppercase font-bold">Violations</div>
+                <div id="metricViolation" class="text-2xl font-bold text-red-600">0</div>
+            </div>
+        </div>
+
+        <!-- Date Range Overlap Warning -->
+        <div id="dateOverlapWarning" class="hidden mt-4 p-4 bg-red-50 border border-red-300 rounded-lg text-sm text-red-800">
+            <strong>⚠️ Date Range Mismatch Detected!</strong>
+            <div id="dateOverlapDetail" class="mt-1 text-xs"></div>
+        </div>
+
+        <!-- Results with Tabs -->
+        <div class="card mt-6">
+            <div class="flex justify-between items-center mb-3">
+                <h3 class="font-bold text-lg">Analysis Results</h3>
+                <div style="display:flex;gap:8px;align-items:center;">
+                    <label <label id="btnBatchUpload" style="display:none;background:linear-gradient(135deg,#7c3aed,#6d28d9);color:white;font-size:0.8rem;font-weight:700;padding:7px 14px;border-radius:6px;cursor:pointer;white-space:nowrap;" title="Select all per-second CSV files — auto-matched by Device ID first, then loco number">
+                        📂 Batch Per-Sec Upload
+                        <input type="file" id="batchPerSecInput" accept=".csv" multiple style="display:none;" onchange="handleBatchPerSec(event)">
+                    </label>
+                    <!-- Batch progress bar -->
+                    <div id="batchProgressWrap" style="display:none;width:220px;background:#f1f5f9;border-radius:6px;overflow:hidden;border:1px solid #e2e8f0;margin-top:3px;">
+                        <div style="display:flex;align-items:center;justify-content:space-between;padding:2px 7px;font-size:0.68rem;color:#6d28d9;font-weight:700;">
+                            <span>Processing…</span><span id="batchProgressLabel">0 / 0</span>
+                        </div>
+                        <div style="height:6px;background:#ede9fe;border-radius:0 0 6px 6px;overflow:hidden;">
+                            <div id="batchProgressBar" style="height:100%;width:0%;background:linear-gradient(90deg,#7c3aed,#a78bfa);transition:width 0.3s ease;"></div>
+                        </div>
+                    </div>
+                    <button onclick="if(confirm('Clear saved session?')){clearSession();location.reload();}" style="background:#f1f5f9;color:#64748b;border:1px solid #e2e8f0;font-size:0.78rem;font-weight:600;padding:7px 12px;border-radius:6px;cursor:pointer;" title="Clear saved session and reload">
+                        🗑 Clear Session
+                    </button>
+                    <button onclick="openPdfDialog()" id="btnWordReport" disabled
+                        style="background:linear-gradient(135deg,#dc2626,#b91c1c);color:white;font-size:0.8rem;font-weight:700;padding:7px 14px;border-radius:6px;cursor:pointer;white-space:nowrap;border:none;"
+                        title="Generate individual PDF reports per violation with LP details">
+                        📋 PDF Report
+                    </button>
+                    <button onclick="openKmlDialog()" id="btnExportKML" style="display:none;background:linear-gradient(135deg,#0891b2,#0e7490);color:white;font-size:0.8rem;font-weight:700;padding:7px 14px;border-radius:6px;cursor:pointer;white-space:nowrap;border:none;" title="Select rows to export as Google Earth KML">
+                        🌍 Export KML
+                    </button>
+                    <button onclick="downloadCSV()" id="btnExport" disabled class="bg-green-600 hover:bg-green-700 text-white text-sm font-bold py-2 px-4 rounded disabled:bg-gray-400">
+                        ⬇ Download CSV
+                    </button>
+                </div>
+            </div>
+
+            <!-- Tab Buttons -->
+            <div class="flex gap-1 border-b border-gray-200 mb-0">
+                <button class="tab-btn tab-violation active" onclick="switchTab('violation')">
+                    🚨 Violations <span class="tab-badge badge-violation" id="badge-violation">0</span>
+                </button>
+                <button class="tab-btn tab-complied" onclick="switchTab('complied')">
+                    ✅ Complied <span class="tab-badge badge-complied" id="badge-complied">0</span>
+                </button>
+                <button class="tab-btn tab-ambiguous" onclick="switchTab('ambiguous')">
+                    ⚠️ Ambiguous <span class="tab-badge badge-ambiguous" id="badge-ambiguous">0</span>
+                </button>
+                <button class="tab-btn tab-notrain" onclick="switchTab('notrain')">
+                    ❌ No Match <span class="tab-badge badge-notrain" id="badge-notrain">0</span>
+                </button>
+                <button class="tab-btn tab-demoted" onclick="switchTab('demoted')">
+                    📋 Demoted <span class="tab-badge badge-demoted" id="badge-demoted">0</span>
+                </button>
+            </div>
+
+            <!-- Shared Table Header Template (rendered per tab) -->
+            <div id="tab-violation" class="tab-content active overflow-x-auto">
+                <table class="min-w-full divide-y divide-gray-200">
+                    <thead class="bg-gray-50" id="thead-violation"></thead>
+                    <tbody id="tbody-violation" class="bg-white divide-y divide-gray-200"></tbody>
+                </table>
+                <div id="nomsg-violation" class="text-center text-gray-400 py-6 hidden">No violations found.</div>
+            </div>
+
+            <div id="tab-complied" class="tab-content overflow-x-auto">
+                <table class="min-w-full divide-y divide-gray-200">
+                    <thead class="bg-gray-50" id="thead-complied"></thead>
+                    <tbody id="tbody-complied" class="bg-white divide-y divide-gray-200"></tbody>
+                </table>
+                <div id="nomsg-complied" class="text-center text-gray-400 py-6 hidden">No complied records found.</div>
+            </div>
+
+            <div id="tab-ambiguous" class="tab-content overflow-x-auto">
+                <table class="min-w-full divide-y divide-gray-200">
+                    <thead class="bg-gray-50" id="thead-ambiguous"></thead>
+                    <tbody id="tbody-ambiguous" class="bg-white divide-y divide-gray-200"></tbody>
+                </table>
+                <div id="nomsg-ambiguous" class="text-center text-gray-400 py-6 hidden">No ambiguous records found.</div>
+            </div>
+
+            <div id="tab-demoted" class="tab-content overflow-x-auto">
+                <div style="background:#e0f2fe;border-left:4px solid #0ea5e9;padding:10px 16px;margin-bottom:8px;font-size:0.82rem;color:#0369a1;border-radius:0 6px 6px 0;">
+                    <b>📋 Demoted from VIOLATION → Complied</b> — these rows had per-sec GPS uploaded, and the train's location at SNT time was beyond the FSD distance threshold.
+                </div>
+                <table class="min-w-full divide-y divide-gray-200">
+                    <thead class="bg-gray-50" id="thead-demoted"></thead>
+                    <tbody id="tbody-demoted" class="bg-white divide-y divide-gray-200"></tbody>
+                </table>
+                <div id="nomsg-demoted" class="text-center text-gray-400 py-6 hidden">No demoted rows yet. Upload per-second files for violation rows.</div>
+            </div>
+
+            <div id="tab-notrain" class="tab-content overflow-x-auto">
+                <table class="min-w-full divide-y divide-gray-200">
+                    <thead class="bg-gray-50" id="thead-notrain"></thead>
+                    <tbody id="tbody-notrain" class="bg-white divide-y divide-gray-200"></tbody>
+                </table>
+                <div id="nomsg-notrain" class="text-center text-gray-400 py-6 hidden">No unmatched SNT records.</div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Map Modal -->
+    <!-- Offscreen containers for report image capture -->
+    <div id="reportMapDiv" style="position:fixed;left:-9999px;top:0;width:900px;height:440px;z-index:-1;overflow:hidden;"></div>
+    <canvas id="reportChartCanvas" style="position:fixed;left:-9999px;top:0;width:900px;height:400px;display:block;z-index:-1;"></canvas>
+
+    <div id="mapModal">
+        <div id="mapBackdrop" onclick="closeMap()"></div>
+        <div id="mapContainer">
+            <div id="mapHeader">
+                <div style="display:flex; align-items:center; gap:10px;">
+                    <div style="background:rgba(255,255,255,0.15); border-radius:8px; padding:6px 8px; display:flex; align-items:center;">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/></svg>
+                    </div>
+                    <div>
+                        <div id="mapTitle" class="font-bold text-sm" style="color:white; letter-spacing:0.01em;">Train Path & Signal Map</div>
+                        <div id="mapSubtitle" style="color:rgba(255,255,255,0.65); font-size:0.7rem; margin-top:1px;"></div>
+                    </div>
+                </div>
+                <button onclick="closeMap()" style="background:rgba(255,255,255,0.12); border:none; border-radius:8px; width:32px; height:32px; cursor:pointer; color:white; font-size:18px; display:flex; align-items:center; justify-content:center; transition:background 0.2s;" onmouseover="this.style.background='rgba(239,68,68,0.7)'" onmouseout="this.style.background='rgba(255,255,255,0.12)'">✕</button>
+            </div>
+            <div style="position:relative; flex:1; min-height:0; display:flex; flex-direction:column;">
+                <!-- MOD2: Draggable violation info panel — inside map wrapper for correct overlay positioning -->
+                <div id="violPanel">
+                    <div class="vp-header">
+                        <span id="vpTitle">🚨 VIOLATION <span class="vp-drag-hint">✥ drag</span></span>
+                        <span class="vp-close" onclick="document.getElementById('violPanel').style.display='none'">✕</span>
+                    </div>
+                    <div id="vpBody"></div>
+                </div>
+                <div id="mapDiv" style="flex:1; min-height:0;"></div>
+                <!-- MOD4: Map filter strip -->
+                <div id="mapFilterStrip">
+                    <label>From</label>
+                    <input type="time" id="mfFromTime" step="1" oninput="mfSyncTimeToStn('from')" onchange="mfApply()">
+                    <select id="mfFromStn" onchange="mfSyncStnToTime('from'); mfApply()"></select>
+                    <span class="fs-sep">→</span>
+                    <label>To</label>
+                    <input type="time" id="mfToTime" step="1" oninput="mfSyncTimeToStn('to')" onchange="mfApply()">
+                    <select id="mfToStn" onchange="mfSyncStnToTime('to'); mfApply()"></select>
+                    <button class="fs-reset" onclick="mfReset()">↺ Reset</button>
+                    <span style="margin-left:auto;color:#94a3b8;font-size:0.65rem;" id="mfPointCount"></span>
+                </div>
+            </div>
+            <div id="mapLegend">
+                <div class="legend-item"><span class="legend-dot" style="background:#ef4444; box-shadow:0 0 0 2px #fca5a5;"></span> <span style="color:#374151; font-weight:600;">Violation (exact)</span></div>
+                <div class="legend-item"><span class="legend-dot" style="background:#f59e0b;"></span> <span style="color:#374151; font-weight:600;">Violation (±5s warn)</span></div>
+                <div class="legend-item"><span class="legend-dot" style="background:#3b82f6;"></span> <span style="color:#374151;">RTIS Track</span></div>
+                <div class="legend-item">
+                    <span style="background:#3b82f6;border:2px solid #1e40af;width:12px;height:12px;border-radius:3px;display:inline-block;flex-shrink:0;"></span>
+                    <span style="color:#374151;">RTIS H Ping</span>
+                </div>
+                <div class="legend-item"><span class="legend-dot" style="background:#10b981;"></span> <span style="color:#374151;">Path Start</span></div>
+                <div class="legend-item"><span class="legend-dot" style="background:#f97316;"></span> <span style="color:#374151;">Path End</span></div>
+                <div class="legend-item">
+                    <span style="background:#8b5cf6; color:white; font-size:9px; font-weight:bold; width:16px; height:16px; border-radius:3px; display:inline-flex; align-items:center; justify-content:center; border:1.5px solid #5b21b6;">▲</span>
+                    <span style="color:#374151;">Signal UP</span>
+                </div>
+                <div class="legend-item">
+                    <span style="background:#f59e0b; color:white; font-size:9px; font-weight:bold; width:16px; height:16px; border-radius:3px; display:inline-flex; align-items:center; justify-content:center; border:1.5px solid #b45309;">▼</span>
+                    <span style="color:#374151;">Signal DN</span>
+                </div>
+                <div style="margin-left:auto; color:#94a3b8; font-size:0.68rem; display:flex; align-items:center; gap:4px;">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+                    Esri Satellite · Click markers for details
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Graph Modal -->
+    <div id="graphModal">
+        <div id="graphBackdrop" onclick="closeGraph()"></div>
+        <div id="graphContainer">
+            <div id="graphHeader">
+                <div style="display:flex;align-items:center;gap:10px;">
+                    <div style="background:rgba(255,255,255,0.15);border-radius:8px;padding:6px 8px;">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" fill="none" stroke="white" stroke-width="2.5" viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+                    </div>
+                    <div>
+                        <div id="graphTitle" class="font-bold text-sm" style="color:white;">Speed-Time Graph</div>
+                        <div id="graphSubtitle" style="color:rgba(255,255,255,0.65);font-size:0.7rem;margin-top:1px;"></div>
+                    </div>
+                </div>
+                <button onclick="closeGraph()" style="background:rgba(255,255,255,0.12);border:none;border-radius:8px;width:32px;height:32px;cursor:pointer;color:white;font-size:18px;display:flex;align-items:center;justify-content:center;" onmouseover="this.style.background='rgba(239,68,68,0.7)'" onmouseout="this.style.background='rgba(255,255,255,0.12)'">✕</button>
+            </div>
+            <div id="graphBody">
+                <!-- MOD4: Graph filter strip -->
+                <div id="gfStrip" class="filter-strip" style="margin-bottom:8px; border-radius:7px; border:1px solid #e2e8f0;">
+                    <label>From</label>
+                    <input type="time" id="gfFromTime" step="1" oninput="gfSyncTimeToStn('from')" onchange="gfApply()">
+                    <select id="gfFromStn" onchange="gfSyncStnToTime('from'); gfApply()"></select>
+                    <span class="fs-sep">→</span>
+                    <label>To</label>
+                    <input type="time" id="gfToTime" step="1" oninput="gfSyncTimeToStn('to')" onchange="gfApply()">
+                    <select id="gfToStn" onchange="gfSyncStnToTime('to'); gfApply()"></select>
+                    <button class="fs-reset" onclick="gfReset()">↺ Reset</button>
+                    <span style="margin-left:auto;color:#94a3b8;font-size:0.65rem;" id="gfPointCount"></span>
+                </div>
+                <div style="position:relative;height:400px;">
+                    <canvas id="speedChart"></canvas>
+                </div>
+                <div id="graphInfo" class="mt-4 text-xs text-gray-500 flex gap-6 flex-wrap"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Station Mapping Editor Modal -->
+    <div id="mapEditorModal">
+        <div id="mapEditorBackdrop" onclick="closeMapEditor()"></div>
+        <div id="mapEditorContainer">
+            <div style="padding:14px 18px;background:linear-gradient(135deg,#1e293b,#064e3b);color:white;display:flex;justify-content:space-between;align-items:center;flex-shrink:0;">
+                <div>
+                    <div class="font-bold text-sm">🗺️ Station Mapping Editor</div>
+                    <div style="color:rgba(255,255,255,0.65);font-size:0.7rem;margin-top:1px;">Review &amp; override auto-detected station mappings</div>
+                </div>
+                <div style="display:flex;gap:8px;align-items:center;">
+                    <button onclick="exportMappingCSV()" style="background:rgba(255,255,255,0.15);border:1px solid rgba(255,255,255,0.3);border-radius:6px;color:white;padding:5px 12px;cursor:pointer;font-size:0.78rem;">⬇ Export CSV</button>
+                    <button onclick="applyMappingEdits()" style="background:#16a34a;border:none;border-radius:6px;color:white;padding:5px 12px;cursor:pointer;font-weight:bold;font-size:0.78rem;">✔ Apply &amp; Re-run</button>
+                    <button onclick="closeMapEditor()" style="background:rgba(255,255,255,0.12);border:none;border-radius:8px;width:30px;height:30px;cursor:pointer;color:white;font-size:16px;display:flex;align-items:center;justify-content:center;" onmouseover="this.style.background='rgba(239,68,68,0.7)'" onmouseout="this.style.background='rgba(255,255,255,0.12)'">✕</button>
+                </div>
+            </div>
+            <div style="padding:14px 18px;background:#f8fafc;border-bottom:1px solid #e2e8f0;font-size:0.75rem;color:#64748b;">
+                🟢 Auto-matched &nbsp;|&nbsp; 🔵 Manual override &nbsp;|&nbsp; 🔴 Unmatched — select FSD station from dropdown
+            </div>
+            <div style="overflow-y:auto;flex:1;padding:14px 18px;">
+                <table class="min-w-full text-xs" id="mappingTable">
+                    <thead><tr style="background:#f1f5f9;">
+                        <th class="px-3 py-2 text-left font-semibold text-gray-600">RTIS Station</th>
+                        <th class="px-3 py-2 text-left font-semibold text-gray-600">Mapped FSD Station</th>
+                        <th class="px-3 py-2 text-left font-semibold text-gray-600">Method</th>
+                        <th class="px-3 py-2 text-left font-semibold text-gray-600">Distance</th>
+                        <th class="px-3 py-2 text-left font-semibold text-gray-600">Override</th>
+                    </tr></thead>
+                    <tbody id="mappingTableBody"></tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- Debug Log Window -->
+    <div class="card mt-6 bg-gray-800 text-green-400 p-4 font-mono text-xs rounded shadow-inner">
+        <div class="flex justify-between border-b border-gray-600 pb-2 mb-2">
+            <h3 class="font-bold text-white">System Logs (Debug)</h3>
+            <div style="display:flex;gap:8px;">
+                <button onclick="openMapEditor()" class="text-blue-300 hover:text-white text-xs border border-blue-700 rounded px-2 py-1">🗺️ Station Mapping Editor</button>
+                <button onclick="document.getElementById('debugLog').innerHTML=''" class="text-gray-400 hover:text-white">Clear</button>
+            </div>
+        </div>
+        <div id="debugLog" class="h-64 overflow-y-auto whitespace-pre-wrap">
+            > System Ready. Load files to inspect data format...
+        </div>
+    </div>
+
+<script src="app.js"></script>
+
+
+    <!-- PDF Report Dialog Modal -->
+    <div id="pdfDialogModal" style="display:none;position:fixed;inset:0;z-index:99998;background:rgba(15,23,42,0.72);backdrop-filter:blur(3px);align-items:flex-start;justify-content:center;overflow-y:auto;padding:20px 12px;">
+        <div style="background:#f8fafc;border-radius:14px;width:100%;max-width:880px;margin:0 auto;box-shadow:0 30px 80px rgba(0,0,0,0.45);overflow:hidden;display:flex;flex-direction:column;">
+
+            <!-- Header -->
+            <div style="background:linear-gradient(135deg,#1e3a5f 0%,#1d4ed8 100%);padding:18px 24px;display:flex;justify-content:space-between;align-items:center;flex-shrink:0;">
+                <div>
+                    <div style="color:white;font-size:1.1rem;font-weight:700;display:flex;align-items:center;gap:8px;">
+                        📋 PDF Violation Reports
+                        <span style="background:rgba(255,255,255,0.15);color:#bfdbfe;font-size:0.72rem;font-weight:600;padding:2px 9px;border-radius:999px;" id="pdfDialogViolCount">0 violations</span>
+                    </div>
+                    <div style="color:#93c5fd;font-size:0.78rem;margin-top:3px;">Fill Loco Pilot details · auto-filled fields are editable · one PDF per violation</div>
+                </div>
+                <div style="display:flex;gap:8px;align-items:center;">
+                    <button onclick="pdfExpandAll(true)"  style="background:rgba(255,255,255,0.12);border:1px solid rgba(255,255,255,0.2);color:#bfdbfe;font-size:0.72rem;padding:5px 10px;border-radius:6px;cursor:pointer;white-space:nowrap;">▾ Expand All</button>
+                    <button onclick="pdfExpandAll(false)" style="background:rgba(255,255,255,0.12);border:1px solid rgba(255,255,255,0.2);color:#bfdbfe;font-size:0.72rem;padding:5px 10px;border-radius:6px;cursor:pointer;white-space:nowrap;">▸ Collapse All</button>
+                    <button onclick="closePdfDialog()" style="background:rgba(255,255,255,0.15);border:none;color:white;font-size:1.1rem;width:32px;height:32px;border-radius:50%;cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0;">✕</button>
+                </div>
+            </div>
+
+            <!-- Cards -->
+            <div id="pdfViolationCards" style="padding:16px 20px;display:flex;flex-direction:column;gap:10px;max-height:72vh;overflow-y:auto;"></div>
+
+            <!-- Footer -->
+            <div style="padding:14px 20px;border-top:1px solid #e2e8f0;display:flex;justify-content:space-between;align-items:center;background:white;flex-shrink:0;">
+                <span style="font-size:0.78rem;color:#64748b;">💡 Tip: Click a card header to expand/collapse. LP fields are optional.</span>
+                <div style="display:flex;gap:10px;">
+                    <button onclick="closePdfDialog()" style="background:#f1f5f9;border:1px solid #e2e8f0;color:#475569;font-weight:600;padding:9px 20px;border-radius:7px;cursor:pointer;font-size:0.85rem;">Cancel</button>
+                    <button onclick="generateAllPdfs()" style="background:linear-gradient(135deg,#dc2626,#b91c1c);border:none;color:white;font-weight:700;padding:9px 24px;border-radius:7px;cursor:pointer;font-size:0.85rem;box-shadow:0 2px 8px rgba(220,38,38,0.35);">⬇ Generate All PDFs</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Word Report Progress Modal -->
+    <div id="reportProgressModal" style="display:none;position:fixed;inset:0;z-index:99999;background:rgba(0,0,0,0.6);align-items:center;justify-content:center;">
+        <div style="background:white;border-radius:14px;padding:32px 40px;min-width:420px;box-shadow:0 30px 80px rgba(0,0,0,0.5);text-align:center;">
+            <div style="font-size:2rem;margin-bottom:10px;">📋</div>
+            <div style="font-size:1.1rem;font-weight:700;color:#1e293b;margin-bottom:6px;">Generating PDF Reports</div>
+            <div id="reportProgressLabel" style="font-size:0.85rem;color:#64748b;margin-bottom:6px;">Initialising…</div>
+            <div style="font-size:0.72rem;color:#94a3b8;margin-bottom:16px;">The map will briefly open &amp; zoom for each violation — this is normal</div>
+            <div style="background:#f1f5f9;border-radius:999px;height:10px;overflow:hidden;margin-bottom:8px;">
+                <div id="reportProgressBar" style="height:100%;width:0%;background:linear-gradient(90deg,#dc2626,#ef4444);border-radius:999px;transition:width 0.3s;"></div>
+            </div>
+            <div id="reportProgressPct" style="font-size:0.78rem;color:#94a3b8;">0%</div>
+        </div>
+    </div>
+
+    <!-- KML Row Selection Modal -->
+    <div id="kmlDialogModal" style="display:none;position:fixed;inset:0;z-index:99998;background:rgba(15,23,42,0.75);backdrop-filter:blur(3px);align-items:flex-start;justify-content:center;overflow-y:auto;padding:20px 12px;">
+        <div style="background:#f8fafc;border-radius:14px;width:100%;max-width:1000px;margin:0 auto;box-shadow:0 30px 80px rgba(0,0,0,0.45);overflow:hidden;display:flex;flex-direction:column;max-height:90vh;">
+            <!-- Header -->
+            <div style="background:linear-gradient(135deg,#0c4a6e 0%,#0891b2 100%);padding:16px 24px;display:flex;justify-content:space-between;align-items:center;flex-shrink:0;">
+                <div>
+                    <div style="color:white;font-size:1.05rem;font-weight:700;display:flex;align-items:center;gap:10px;">
+                        🌍 Export KML — Select Rows
+                        <span id="kmlSelCount" style="background:rgba(255,255,255,0.18);color:#bae6fd;font-size:0.72rem;font-weight:600;padding:2px 10px;border-radius:999px;">0 / 0 selected</span>
+                    </div>
+                    <div style="color:#bae6fd;font-size:0.75rem;margin-top:3px;">Only rows with per-second data are shown · one KML file with one folder per selected row</div>
+                </div>
+                <div style="display:flex;gap:8px;align-items:center;">
+                    <button onclick="kmlSelectAll(true)"  style="background:rgba(255,255,255,0.14);border:1px solid rgba(255,255,255,0.25);color:#e0f2fe;font-size:0.72rem;padding:5px 11px;border-radius:6px;cursor:pointer;">☑ All</button>
+                    <button onclick="kmlSelectAll(false)" style="background:rgba(255,255,255,0.14);border:1px solid rgba(255,255,255,0.25);color:#e0f2fe;font-size:0.72rem;padding:5px 11px;border-radius:6px;cursor:pointer;">☐ None</button>
+                    <button onclick="closeKmlDialog()" style="background:rgba(255,255,255,0.15);border:none;color:white;font-size:1.1rem;width:32px;height:32px;border-radius:50%;cursor:pointer;display:flex;align-items:center;justify-content:center;">✕</button>
+                </div>
+            </div>
+            <!-- Table -->
+            <div style="overflow:auto;flex:1;">
+                <table style="width:100%;border-collapse:collapse;font-size:0.82rem;">
+                    <thead style="position:sticky;top:0;z-index:2;">
+                        <tr style="background:#0c4a6e;color:white;">
+                            <th style="padding:9px 10px;text-align:left;font-weight:600;white-space:nowrap;"></th>
+                            <th style="padding:9px 10px;text-align:left;font-weight:600;white-space:nowrap;">Train No</th>
+                            <th style="padding:9px 10px;text-align:left;font-weight:600;white-space:nowrap;">Loco</th>
+                            <th style="padding:9px 10px;text-align:left;font-weight:600;white-space:nowrap;">Station</th>
+                            <th style="padding:9px 10px;text-align:left;font-weight:600;white-space:nowrap;">RTIS Time</th>
+                            <th style="padding:9px 10px;text-align:left;font-weight:600;white-space:nowrap;">Signal Time</th>
+                            <th style="padding:9px 10px;text-align:left;font-weight:600;white-space:nowrap;">Sig No</th>
+                            <th style="padding:9px 10px;text-align:left;font-weight:600;white-space:nowrap;">Dir(GPS)</th>
+                            <th style="padding:9px 10px;text-align:left;font-weight:600;white-space:nowrap;">Speed</th>
+                            <th style="padding:9px 10px;text-align:left;font-weight:600;white-space:nowrap;">Result</th>
+                            <th style="padding:9px 10px;text-align:left;font-weight:600;white-space:nowrap;">Per-Sec</th>
+                        </tr>
+                    </thead>
+                    <tbody id="kmlDialogTbody"></tbody>
+                </table>
+            </div>
+            <!-- Footer -->
+            <div style="padding:13px 20px;border-top:1px solid #e2e8f0;display:flex;justify-content:space-between;align-items:center;background:white;flex-shrink:0;">
+                <span style="font-size:0.78rem;color:#64748b;">💡 Click a row or its checkbox to select · Select All / None at top</span>
+                <div style="display:flex;gap:10px;">
+                    <button onclick="closeKmlDialog()" style="background:#f1f5f9;border:1px solid #e2e8f0;color:#475569;font-weight:600;padding:9px 20px;border-radius:7px;cursor:pointer;font-size:0.85rem;">Cancel</button>
+                    <button id="kmlGenerateBtn" onclick="generateSelectedKML()" disabled style="background:linear-gradient(135deg,#0891b2,#0e7490);border:none;color:white;font-weight:700;padding:9px 24px;border-radius:7px;cursor:pointer;font-size:0.85rem;opacity:0.45;box-shadow:0 2px 8px rgba(8,145,178,0.35);">🌍 Generate KML</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+</body>
+</html>
