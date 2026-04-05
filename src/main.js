@@ -1,3 +1,19 @@
+import Papa from 'papaparse';
+import * as L from 'leaflet';
+import Chart from 'chart.js/auto';
+import html2canvas from 'html2canvas';
+import * as XLSX from 'xlsx';
+import leafletImage from 'leaflet-image';
+import { jsPDF } from 'jspdf';
+
+window.Papa = Papa;
+window.L = L;
+window.Chart = Chart;
+window.html2canvas = html2canvas;
+window.XLSX = XLSX;
+window.leafletImage = leafletImage;
+window.jsPDF = jsPDF;
+
 // --- Global State ---
     var dataRTIS = [];
     var dataSNT = [];
@@ -4574,4 +4590,36 @@
         log('✅ KML exported — open in Google Earth Pro or import to Google My Maps.');
     }
 
+
+
+
+// Exposing inline handlers to window for Vite module compatibility
+window.closeDemotionToast = closeDemotionToast;
+window.runAnalysis = runAnalysis;
+window.handleBatchPerSec = handleBatchPerSec;
+window.clearSession = clearSession;
+window.openPdfDialog = openPdfDialog;
+window.openKmlDialog = openKmlDialog;
+window.downloadCSV = downloadCSV;
+window.switchTab = switchTab;
+window.closeMap = closeMap;
+window.mfSyncTimeToStn = mfSyncTimeToStn;
+window.mfSyncStnToTime = mfSyncStnToTime;
+window.mfApply = mfApply;
+window.mfReset = mfReset;
+window.closeGraph = closeGraph;
+window.gfSyncTimeToStn = gfSyncTimeToStn;
+window.gfSyncStnToTime = gfSyncStnToTime;
+window.gfApply = gfApply;
+window.gfReset = gfReset;
+window.closeMapEditor = closeMapEditor;
+window.exportMappingCSV = exportMappingCSV;
+window.applyMappingEdits = applyMappingEdits;
+window.openMapEditor = openMapEditor;
+window.pdfExpandAll = pdfExpandAll;
+window.closePdfDialog = closePdfDialog;
+window.generateAllPdfs = generateAllPdfs;
+window.kmlSelectAll = kmlSelectAll;
+window.closeKmlDialog = closeKmlDialog;
+window.generateSelectedKML = generateSelectedKML;
 

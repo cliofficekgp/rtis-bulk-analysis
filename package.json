@@ -1,0 +1,35 @@
+{
+  "name": "codebase",
+  "version": "1.0.0",
+  "description": "A modular web application for analyzing Railway Signal (SNT) events against RTIS GPS data and FSD master logs to detect signal violations.",
+  "main": "app.js",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cliofficekgp/rtis-bulk-analysis.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/cliofficekgp/rtis-bulk-analysis/issues"
+  },
+  "homepage": "https://github.com/cliofficekgp/rtis-bulk-analysis#readme",
+  "dependencies": {
+    "chart.js": "^4.5.1",
+    "html2canvas": "^1.4.1",
+    "jspdf": "^4.2.1",
+    "leaflet": "^1.9.4",
+    "leaflet-image": "^0.4.0",
+    "papaparse": "^5.5.3",
+    "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "vite": "^8.0.3"
+  }
+}
