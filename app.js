@@ -2432,10 +2432,10 @@
             if (nums.length) {
                 var firstNum = nums[0];
                 analysisResults.forEach(function(r, ri) {
-                    if (String(r.deviceId || '').trim() === firstNum) rowsForFile.push(ri);
+                    if (String(r.deviceId || '').trim() === firstNum && r.speed > 50) rowsForFile.push(ri);
                 });
                 if (rowsForFile.length)
-                    log('📡 Device ID match: ' + fname + ' → Device ' + firstNum + ' (' + rowsForFile.length + ' row(s))');
+                    log('📡 Device ID match: ' + fname + ' → Device ' + firstNum + ' (' + rowsForFile.length + ' row(s) > 50 km/h)');
             }
 
             // Priority 2: Loco number fallback
@@ -2443,17 +2443,20 @@
                 var matchedLocos = new Set();
                 nums.forEach(function(n) {
                     var loco = parseInt(n);
-                    analysisResults.forEach(function(r) { if (parseInt(r.loco) === loco) matchedLocos.add(loco); });
+                    analysisResults.forEach(function(r) { 
+                        if (parseInt(r.loco) === loco && r.speed > 50) matchedLocos.add(loco); 
+                    });
                 });
                 for (var ri2 = 0; ri2 < analysisResults.length; ri2++) {
-                    if (matchedLocos.has(parseInt(analysisResults[ri2].loco))) rowsForFile.push(ri2);
+                    var r = analysisResults[ri2];
+                    if (matchedLocos.has(parseInt(r.loco)) && r.speed > 50) rowsForFile.push(ri2);
                 }
                 if (rowsForFile.length)
-                    log('🔢 Loco fallback: ' + fname + ' → loco(s) ' + Array.from(matchedLocos).join(','));
+                    log('🔢 Loco fallback: ' + fname + ' → loco(s) ' + Array.from(matchedLocos).join(',') + ' (' + rowsForFile.length + ' row(s) > 50 km/h)');
             }
 
             if (rowsForFile.length === 0) {
-                log('⚠️  No match: ' + fname + ' (nums: ' + nums.join(',') + ')');
+                log('⚠️  Skipped: ' + fname + ' — No matched rows with speed > 50 km/h (nums: ' + nums.join(',') + ')');
                 skipped++;
                 return;
             }
