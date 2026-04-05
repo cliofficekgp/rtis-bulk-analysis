@@ -3691,192 +3691,36 @@ window.jsPDF = jsPDF;
     }
 
     // ══════════════════════════════════════════════════════════════
-    // SPEED-TIME GRAPH
-    // ══════════════════════════════════════════════════════════════
-    function openGraph(resultIdx) {
-        var row = analysisResults[resultIdx];
-        if (!row) return;
+// SPEED-TIME GRAPH (Extracted to src/ui/speed-graph.js)
+// ══════════════════════════════════════════════════════════════
+import { processSpeedGraph as _openGraph, closeSpeedGraph as _closeGraph } from './ui/speed-graph.js';
 
-        var speedLimit = parseFloat(document.getElementById('inputSpeedLimit').value) || 63;
-        var hasPersec  = perSecondData[resultIdx] && perSecondData[resultIdx].length > 0;
+function openGraph(resultIdx) {
+    var speedLimit = parseFloat(document.getElementById('inputSpeedLimit').value) || 63;
+    speedChartInstance = _openGraph(resultIdx, analysisResults, perSecondData, dataRTIS, speedLimit, speedChartInstance, _initFilterUI, _msToTimeStr, _buildStnOptions, _drawChart, matchPerSecToSNT);
+}
 
-        // Reconstruct SNT datetime (same logic as buildMap)
-        var sntDateObj = row.sntTimeISO ? new Date(row.sntTimeISO) : (function() {
-            var base = row.violationTime instanceof Date ? row.violationTime : new Date(row.violationTimeStr);
-            var d = new Date(base);
-            var tp = (row.signalTime || '').match(/(\d{1,2}):(\d{2})(?::(\d{2}))?/);
-            if (tp) d.setHours(parseInt(tp[1]), parseInt(tp[2]), parseInt(tp[3]||0), 0);
-            return d;
-        })();
+function closeGraph() {
+    speedChartInstance = _closeGraph(speedChartInstance);
+}
 
-        document.getElementById('graphModal').classList.add('open');
-        document.getElementById('graphTitle').innerText = 'Train ' + row.trainNo + ' — ' + row.station + ' — ' + row.sigNo;
+// ══════════════════════════════════════════════════════════════
+// STATION MAPPING EDITOR (Extracted to src/ui/mapping-editor.js)
+// ══════════════════════════════════════════════════════════════
+import { openMapEditor as _openMapEditor, closeMapEditor as _closeMapEditor, getMappingEdits, exportMappingCSV as _exportMappingCSV } from './ui/mapping-editor.js';
 
-        // Build the display points
-        var displayPts = [];
+function openMapEditor() { _openMapEditor(dataRTIS, allFsdStationNames, stationMappingCache, manualOverrides); }
+function closeMapEditor() { _closeMapEditor(); }
+function applyMappingEdits() {
+    getMappingEdits(manualOverrides, stationMappingCache);
+    closeMapEditor();
+    log('✏️ Manual overrides saved. Re-running analysis...');
+    if (dataRTIS.length && dataSNT.length && dataFSD.length) { setTimeout(function() { executeLogic(); }, 100); }
+}
+function exportMappingCSV() { _exportMappingCSV(dataRTIS, stationMappingCache, manualOverrides); }
 
-        if (hasPersec) {
-            // MOD4: per-sec — use ALL points, filter strip controls window
-            var allPts = perSecondData[resultIdx];
-            var grMatch = row.perSecMatch || matchPerSecToSNT(allPts, sntDateObj);
-
-            document.getElementById('graphSubtitle').innerText =
-                'Per-sec | SNT: ' + sntDateObj.toLocaleTimeString() +
-                (grMatch ? ' [' + grMatch.quality + ', Δ' + (grMatch.diffMs/1000).toFixed(1) + 's]' : '') +
-                ' | Limit: ' + speedLimit + ' km/h | Signal: ' + row.signalTime;
-
-            // Default ±3 min window
-            var violMs = sntDateObj.getTime();
-            var w3 = 3*60*1000;
-            displayPts = allPts.filter(function(p){ return Math.abs(p.time.getTime()-violMs)<=w3; });
-
-            // Init filter UI (auto-populate from+to to full extent of allPts)
-            _initFilterUI(allPts, sntDateObj.getTime(), resultIdx, row);
-            // Update 'from'/'to' time inputs to the default ±3min window
-            if(displayPts.length>0){
-                document.getElementById('gfFromTime').value = _msToTimeStr(displayPts[0].time.getTime());
-                document.getElementById('gfToTime').value   = _msToTimeStr(displayPts[displayPts.length-1].time.getTime());
-                _buildStnOptions(document.getElementById('gfFromStn'), allPts, displayPts[0].time.getTime());
-                _buildStnOptions(document.getElementById('gfToStn'),   allPts, displayPts[displayPts.length-1].time.getTime());
-            }
-
-        } else {
-            // MOD3: RTIS-only — plot all pings for this train at this station
-            document.getElementById('graphSubtitle').innerText =
-                'RTIS pings at station | Limit: ' + speedLimit + ' km/h | Signal: ' + row.signalTime;
-            document.getElementById('gfStrip').style.display = 'none';  // no filter for RTIS-only
-
-            var trainKey   = String(row.trainNo);
-            var stationKey = row.stationKey || cleanStationName(row.station.split('→')[0].trim());
-
-            dataRTIS.forEach(function(r) {
-                var t   = getCol(r, ['Train Number','Train No.','TRAIN','Train']);
-                var stn = cleanStationName(getCol(r, ['Station','STATION','STN_CODE']));
-                if (String(t) !== trainKey) return;
-                if (stn !== stationKey) return;
-                var timeRaw = getCol(r, ['Event Time','TIME','EventTime','Date']);
-                var speed   = parseFloat(getCol(r, ['Speed','SPEED']));
-                var tm      = parseSmartDate(timeRaw);
-                if (tm && !isNaN(speed)) displayPts.push({ time:tm, speed:speed, stn:stn, lat:null, lon:null });
-            });
-            displayPts.sort(function(a,b){ return a.time - b.time; });
-
-            // Fallback: always show at least the matched RTIS point
-            if (displayPts.length === 0) {
-                var base = row.violationTime instanceof Date ? row.violationTime : new Date(row.violationTimeStr);
-                displayPts.push({ time:base, speed:parseFloat(row.speed), stn:row.stationKey||'', lat:null, lon:null });
-            }
-        }
-
-        setTimeout(function() { _drawChart(displayPts, sntDateObj.getTime(), row); }, 80);
-    }
-
-    function closeGraph() {
-        document.getElementById('graphModal').classList.remove('open');
-        if (speedChartInstance) { speedChartInstance.destroy(); speedChartInstance = null; }
-        document.getElementById('gfStrip').style.display = 'none';
-    }
-
-    // ══════════════════════════════════════════════════════════════
-    // STATION MAPPING EDITOR
-    // ══════════════════════════════════════════════════════════════
-    function openMapEditor() {
-        // Collect all unique RTIS stations
-        var rtisStations = new Set();
-        dataRTIS.forEach(function(r) {
-            var s = cleanStationName(getCol(r, ['Station','STATION','STN_CODE']));
-            if (s) rtisStations.add(s);
-        });
-
-        var tbody = document.getElementById('mappingTableBody');
-        tbody.innerHTML = '';
-
-        Array.from(rtisStations).sort().forEach(function(rtis) {
-            var cached = stationMappingCache[rtis];
-            var manual = manualOverrides[rtis];
-            var mapped  = manual || (cached && cached.fsdStation) || null;
-            var method  = manual ? 'manual' : (cached ? cached.method : 'unmatched');
-            var distStr = (cached && cached.distKm != null) ? (cached.distKm*1000).toFixed(0)+'m' : (method==='exact'?'0m':'—');
-
-            var rowClass = method==='manual' ? 'mapping-row-manual' : (mapped ? 'mapping-row-auto' : 'mapping-row-unmatched');
-            var methodBadge = {
-                'exact': '✅ Exact', 'name-sim': '🔗 Name-sim', 'proximity': '📍 Proximity',
-                'manual': '✏️ Manual', 'unmatched': '❌ No match'
-            }[method] || method;
-
-            // Build FSD station select options
-            var opts = '<option value="">— not mapped —</option>';
-            allFsdStationNames.forEach(function(fk) {
-                opts += '<option value="' + fk + '"' + (fk === mapped ? ' selected' : '') + '>' + fk + '</option>';
-            });
-
-            var tr = document.createElement('tr');
-            tr.className = rowClass;
-            tr.innerHTML =
-                '<td class="px-3 py-2 font-mono font-bold text-gray-800">' + rtis + '</td>' +
-                '<td class="px-3 py-2 font-mono text-green-700">' + (mapped || '—') + '</td>' +
-                '<td class="px-3 py-2">' + methodBadge + '</td>' +
-                '<td class="px-3 py-2 text-gray-500">' + distStr + '</td>' +
-                '<td class="px-3 py-2"><select class="border rounded text-xs p-1 mapping-override" data-rtis="' + rtis + '">' + opts + '</select></td>';
-            tbody.appendChild(tr);
-        });
-
-        document.getElementById('mapEditorModal').classList.add('open');
-    }
-
-    function closeMapEditor() {
-        document.getElementById('mapEditorModal').classList.remove('open');
-    }
-
-    function applyMappingEdits() {
-        // Read all selects and store manual overrides
-        document.querySelectorAll('.mapping-override').forEach(function(sel) {
-            var rtis = sel.getAttribute('data-rtis');
-            var val  = sel.value;
-            if (val) {
-                manualOverrides[rtis] = val;
-                // Clear from cache so manual wins on next run
-                delete stationMappingCache[rtis];
-            } else {
-                delete manualOverrides[rtis];
-                delete stationMappingCache[rtis];
-            }
-        });
-        closeMapEditor();
-        log('✏️ Manual overrides saved: ' + Object.keys(manualOverrides).length + ' station(s). Re-running analysis...');
-        // Re-run analysis with new mappings
-        if (dataRTIS.length && dataSNT.length && dataFSD.length) {
-            setTimeout(function() { executeLogic(); }, 100);
-        }
-    }
-
-    function exportMappingCSV() {
-        var rtisStations = new Set();
-        dataRTIS.forEach(function(r) {
-            var s = cleanStationName(getCol(r, ['Station','STATION','STN_CODE']));
-            if (s) rtisStations.add(s);
-        });
-        var rows = ['"RTIS Station","Mapped FSD Station","Method","Distance"'];
-        Array.from(rtisStations).sort().forEach(function(rtis) {
-            var manual  = manualOverrides[rtis];
-            var cached  = stationMappingCache[rtis];
-            var mapped  = manual || (cached && cached.fsdStation) || '';
-            var method  = manual ? 'manual' : (cached ? cached.method : 'unmatched');
-            var distStr = (cached && cached.distKm != null) ? (cached.distKm*1000).toFixed(0)+'m' : '';
-            rows.push('"'+rtis+'","'+mapped+'","'+method+'","'+distStr+'"');
-        });
-        var blob = new Blob([rows.join('\n')], { type: 'text/csv' });
-        var a = document.createElement('a');
-        a.href = URL.createObjectURL(blob);
-        a.download = 'station_mapping.csv';
-        a.click();
-    }
-
-    // Backdrop close handled by onclick on backdrops.
-
-
-
-    // ════════════════════════════════════════════════════════════════
+// Backdrop close handled by onclick on backdrops.
+// ════════════════════════════════════════════════════════════════
     // MOD 2: DRAGGABLE VIOLATION PANEL
     // ════════════════════════════════════════════════════════════════
     (function(){

@@ -1,0 +1,22 @@
+export const State = {
+    dataRTIS: [],
+    dataSNT: [],
+    sntFileCount: 0,
+    sntFileNames: [],
+    dataFSD: [],
+    analysisResults: [],
+    fsdMap: {},
+    batchRunning: false,
+    batchTotal: 0,
+    batchDone: 0,
+    noTrainResults: [],
+    perSecondData: {},
+    validationReport: { rtis:{}, snt:{}, fsd:{}, cross:{} },
+    filesLoaded: { rtis:false, snt:false, fsd:false },
+    currentTab: 'violation',
+    stationMappingCache: {},
+    manualOverrides: {},
+    speedChartInstance: null,
+    allFsdStationNames: [],
+    pdfViolations: []
+};
