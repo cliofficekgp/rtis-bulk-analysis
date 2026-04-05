@@ -3520,8 +3520,8 @@ window.jsPDF = jsPDF;
     }
 
     async function _buildSinglePdf(row, vi, speedLimit, trainNoEdited, lpName, lpHQ, lpCLI, trainDate, journeyDate, remarks, mapDataUrl, chartDataUrl) {
-        var { jsPDF } = window.jspdf;
-        var doc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
+        
+        var doc = new window.jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
         var W = 210, H = 297;
         var mg = 10;   // margin
         var cW = W - mg*2; // content width
