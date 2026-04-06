@@ -7,6 +7,7 @@ import leafletImage from 'leaflet-image';
 import { jsPDF } from 'jspdf';
 import { handleFile as _handleFile, handleXlsxFile as _handleXlsxFile, initFileHandlers } from './core/data-loader.js';
 import { validateRTISData as _validateRTIS, validateSNTData as _validateSNT, validateFSDData as _validateFSD, performCrossValidation as _performCrossValidation, displayValidationReport as _displayValidationReport } from './core/data-validator.js';
+import { handlePerSecFile as _handlePerSecFile, handleBatchPerSec as _handleBatchPerSec, matchPerSecToSNT as _matchPerSecToSNT } from './core/gps-handler.js';
 
 window.Papa = Papa;
 window.L = L;
@@ -809,245 +810,35 @@ window.jsPDF = jsPDF;
     }
 
     // ==========================================
-    // PER-SECOND FILE UPLOAD HANDLER
+    // PER-SECOND FILE UPLOAD (delegated to src/core/gps-handler.js)
     // ==========================================
-    function handlePerSecFile(event, rowIdx, _onDone) {
-        var file = event.target.files[0];
-        if (!file) { if (_onDone) _onDone(); return; }
-
-        log("📁 Loading per-second data for row " + rowIdx + ": " + file.name);
-
-        Papa.parse(file, {
-            header: true,
-            skipEmptyLines: true,
-            dynamicTyping: true,
-            complete: function(results) {
-                var data = results.data;
-
-                // Parse per-second rows
-                var parsedData = [];
-                data.forEach(function(row) {
-                    var timeRaw = getCol(row, ['Logging Time','TIME','Time','EventTime']);
-                    var lat     = parseFloat(getCol(row, ['Latitude','Lattitude','LAT','Lat']));
-                    var lon     = parseFloat(getCol(row, ['Longitude','LON','Lon','LONGITUDE']));
-                    var speed   = parseFloat(getCol(row, ['Speed','SPEED']));
-                    var time    = parseSmartDate(timeRaw);
-                    if (time && isValidGPS(lat, lon)) {
-                        parsedData.push({
-                            time : time,
-                            lat  : lat,
-                            lon  : lon,
-                            speed: speed,
-                            stn  : getCol(row, ['last/cur stationCode','Station','STATION','STN_CODE']) || '—',
-                            distFromSpeed: (function(){ var d=parseFloat(getCol(row,['distFromSpeed','DistFromSpeed','DISTFROMSPEED','dist_from_speed'])); return isNaN(d)?null:d; })()
-                        });
-                    }
-                });
-
-                // Sort by time ascending
-                parsedData.sort(function(a, b) { return a.time - b.time; });
-                perSecondData[rowIdx] = parsedData;
-
-                // Enable KML export button now that per-sec data exists
-                _updateKmlButton();
-
-                // ── EXACT SNT-TIME MATCH ──────────────────────────────
-                var row = analysisResults[rowIdx];
-                if (row) {
-                    // Build SNT Date from stored signal time string + violation date
-                    // row.violationTime holds the RTIS event Date; use its date part + SNT time string
-                    var sntBase = row.violationTime instanceof Date
-                                    ? row.violationTime
-                                    : new Date(row.violationTimeStr);
-
-                    // Try to reconstruct SNT datetime: use sntTimeISO if stored, else parse signalTime
-                    var sntDateObj = row.sntTimeISO ? new Date(row.sntTimeISO) : (function() {
-                        // Combine date from sntBase + time from row.signalTime (HH:MM:SS)
-                        var d    = new Date(sntBase);
-                        var tStr = row.signalTime || '';
-                        var tp   = tStr.match(/(\d{1,2}):(\d{2})(?::(\d{2}))?/);
-                        if (tp) {
-                            d.setHours(parseInt(tp[1]), parseInt(tp[2]), parseInt(tp[3]||0), 0);
-                        }
-                        return d;
-                    })();
-
-                    var match = matchPerSecToSNT(parsedData, sntDateObj);
-
-                    // Store match result on the row object
-                    row.perSecMatch = match;
-
-                    var speedLimit = parseFloat(document.getElementById('inputSpeedLimit').value) || 63;
-                    if (match.quality !== 'none' && match.point) {
-                        var diffSec = (match.diffMs / 1000).toFixed(1);
-                        var speedPs = !isNaN(match.point.speed) ? match.point.speed : null;
-
-                        log('🎯 SNT-time match [' + match.quality + ']: diff=' + diffSec + 's' +
-                            (speedPs !== null ? ', speed=' + speedPs + ' km/h' : '') +
-                            ' | resultClass=' + row.resultClass +
-                            ' dirMismatch=' + row.dirMismatch);
-
-                        // ── STEP 1: Store per-sec speed on row FIRST ──────────────────────────────
-                        // Must happen before renderTable() so it renders the correct speed cell.
-                        if (speedPs !== null) {
-                            row.speedPerSec  = speedPs;
-                            row.speedMatchQ  = match.quality;
-                            row.speedDiffSec = diffSec;
-                        }
-
-                        // ── STEP 2: Shared FSD distance calculation ──────────────────────────────
-                        var pLat = match.point.lat;
-                        var pLon = match.point.lon;
-                        var trainDir = row.direction || row.dirTrain || '';
-                        var stnKey   = row.fsdStation;
-                        var psDistToFsd = null;
-                        var fsdThreshold = parseFloat(document.getElementById('inputFsdThreshold').value) || 200;
-
-                        if (speedPs !== null && speedPs > speedLimit && isValidGPS(pLat, pLon)) {
-                            // Build signal list: prefer live fsdMap (analysis in memory),
-                            // fall back to cachedFsdSignals on the row (survives session restore)
-                            var _sigList = [];
-                            if (stnKey && fsdMap[stnKey]) {
-                                var _ds = (fsdMap[stnKey][trainDir] || []);
-                                if (!_ds.length) _ds = (fsdMap[stnKey].UP || []).concat(fsdMap[stnKey].DN || []);
-                                _sigList = _ds;
-                            } else if (row.cachedFsdSignals && row.cachedFsdSignals.length) {
-                                // Session restore path: use signals cached at analysis time
-                                _sigList = row.cachedFsdSignals.filter(function(s){ return s.dir === trainDir; });
-                                if (!_sigList.length) _sigList = row.cachedFsdSignals;
-                                log('ℹ️  Using cachedFsdSignals for FSD dist (fsdMap not in memory)');
-                            }
-                            if (_sigList.length) {
-                                var minD = Infinity;
-                                _sigList.forEach(function(sig) {
-                                    if (!isValidGPS(sig.lat, sig.lon)) return;
-                                    var d = getDistance(pLat, pLon, sig.lat, sig.lon) * 1000;
-                                    if (d < minD) minD = d;
-                                });
-                                if (isFinite(minD)) psDistToFsd = minD;
-                                log('📍 per-sec→FSD dist = ' + psDistToFsd.toFixed(0) + 'm (threshold=' + fsdThreshold + 'm, dir=' + trainDir + ')');
-                            }
-                        }
-
-                        // ── STEP 3: DEMOTION — violation row that is far from FSD signal ────────
-                        var classChanged = false;
-                        if (speedPs !== null && speedPs > speedLimit &&
-                            (row.resultClass === 'violation' || row.resultClass === 'violation-multi') &&
-                            psDistToFsd !== null && psDistToFsd > fsdThreshold) {
-
-                            row.resultClass   = 'complied';
-                            row.result        = 'Complied';
-                            row.perSecDemoted = true;
-                            row.perSecDemotedReason =
-                                'Per-sec GPS at SNT time is ' + psDistToFsd.toFixed(0) +
-                                ' m from FSD signal (' + trainDir + ') — exceeds threshold ' +
-                                fsdThreshold + ' m. Train was not at the signal when SNT fired.';
-                            log('✅ DEMOTED to Complied: dist ' + psDistToFsd.toFixed(0) + 'm > ' + fsdThreshold + 'm, row ' + rowIdx);
-                            showDemotionToast(row.trainNo, psDistToFsd, trainDir, row.perSecDemotedReason);
-                            classChanged = true;
-                        }
-
-                        // ── STEP 4: PROMOTION — complied row (correct direction) with per-sec overspeed ──
-                        // Conditions:
-                        //   1. row.resultClass === 'complied'  (not violation/ambiguous)
-                        //   2. row.dirMismatch is false/undefined  (direction was correct at analysis time)
-                        //   3. row.perSecDemoted is falsy  (not demoted in this same run)
-                        //   4. speedPs > speedLimit
-                        //   5. Either no FSD distance available, OR GPS is within threshold of signal
-                        if (speedPs !== null && speedPs > speedLimit &&
-                            row.resultClass === 'complied' &&
-                            !row.dirMismatch &&
-                            !row.perSecDemoted) {
-
-                            var tooFarFromSignal = (psDistToFsd !== null && psDistToFsd > fsdThreshold);
-                            if (!tooFarFromSignal) {
-                                row.resultClass    = 'violation';
-                                row.result         = 'VIOLATION';
-                                row.perSecPromoted = true;
-                                row.perSecPromotedReason =
-                                    'Per-sec GPS confirms ' + speedPs + ' km/h at SNT time — ' +
-                                    'exceeds ' + speedLimit + ' km/h limit.' +
-                                    (psDistToFsd !== null
-                                        ? ' GPS distance to FSD signal: ' + psDistToFsd.toFixed(0) + 'm (within ' + fsdThreshold + 'm).'
-                                        : ' (No FSD distance check — FSD data not available.)') +
-                                    ' RTIS speed was ' + row.speed + ' km/h (under limit at minute precision).';
-                                log('🚨 PROMOTED to VIOLATION: row=' + rowIdx +
-                                    ' train=' + row.trainNo +
-                                    ' per-sec=' + speedPs + ' km/h > ' + speedLimit + ' km/h' +
-                                    (psDistToFsd !== null ? ' dist=' + psDistToFsd.toFixed(0) + 'm' : ' no-fsd-dist'));
-                                classChanged = true;
-                            } else {
-                                log('ℹ️ Complied row NOT promoted: overspeed but GPS ' +
-                                    psDistToFsd.toFixed(0) + 'm > threshold ' + fsdThreshold + 'm — not at signal point.');
-                            }
-                        }
-
-                        // ── STEP 5: Re-render + save if classification changed ────────────────
-                        // During batch upload (_batchRunning) we suppress individual renderTable
-                        // calls — the batch dispatcher does one final renderTable at the end.
-                        if (classChanged) {
-                            if (!_batchRunning) { renderTable(); saveSession(); }
-                        } else if (speedPs !== null) {
-                            // No class change — just patch the speed cell in place (faster than re-render)
-                            ['violation','complied','ambiguous'].forEach(function(tabId) {
-                                var tbody = document.getElementById('tbody-' + tabId);
-                                if (!tbody) return;
-                                var gBtn = tbody.querySelector('#graphBtn' + rowIdx);
-                                if (!gBtn) return;
-                                var tr = gBtn.closest('tr');
-                                if (!tr) return;
-                                var tds = tr.querySelectorAll('td');
-                                if (tds.length > 7) {
-                                    var colorCls = speedPs > speedLimit ? 'speed-warn' : 'speed-exact';
-                                    var badgeCls = match.quality === 'exact' ? 'match-badge-exact' : 'match-badge-tol';
-                                    var badgeTxt = match.quality === 'exact' ? '✓ exact' : '⚠ +' + diffSec + 's';
-                                    tds[7].innerHTML =
-                                        '<span class="' + colorCls + '">' + speedPs + '</span>' +
-                                        '<span class="' + badgeCls + '" title="Per-second speed at SNT time (diff=' + diffSec + 's)">' + badgeTxt + '</span>';
-                                }
-                                if (tds.length > 11) {
-                                    tds[11].innerHTML = '<span class="precision-flag-sec" title="Per-second file loaded">✓ sec</span>';
-                                }
-                            });
-                        }
-
-                        // Update Map + Graph button styles
-                        _updateKmlButton();
-                        var mapBtnDom = document.getElementById('mapBtn' + rowIdx);
-                        if (mapBtnDom) {
-                            mapBtnDom.style.background = 'linear-gradient(135deg,#059669 0%,#047857 100%)';
-                            mapBtnDom.title = 'View detailed track (' + parsedData.length + ' pts)';
-                        }
-                        var graphBtnDom = document.getElementById('graphBtn' + rowIdx);
-                        if (graphBtnDom) {
-                            graphBtnDom.classList.add('has-persec');
-                            graphBtnDom.title = 'Speed-Time Graph (±3 min per-second · exact SNT match)';
-                        }
-
-                        // ── Warn if outside ±5 s ─────────────────────────────
-                        if (match.quality === 'closest') {
-                            log('⚠️  Closest point is ' + diffSec + 's away from SNT time — outside ±5s tolerance. Marker shown with warning.');
-                        }
-
-                    } else {
-                        log('⚠️  No per-second points to match for row ' + rowIdx);
-                    }
-                }
-
-                // MOD4: init filter context (for the currently open graph if same row)
-                if (_fc && _fc.resultIdx === rowIdx) {
-                    _initFilterUI(parsedData, _fc.sntMs, rowIdx, _fc.row);
-                }
-
-                log("✅ Loaded " + parsedData.length + " per-second points for row " + rowIdx);
-                if (_onDone) _onDone();   // signal batch queue: this file is done
-            },
-            error: function(err) {
-                log("❌ Error parsing per-second file: " + err.message);
-                if (!_batchRunning) alert("Error parsing CSV file. Check format.");
-                if (_onDone) _onDone();   // still resolve so queue continues
+    function _buildGpsCtx() {
+        return {
+            analysisResults: analysisResults,
+            perSecondData: perSecondData,
+            fsdMap: fsdMap,
+            _fc: typeof _fc !== 'undefined' ? _fc : null,
+            log: log,
+            renderTable: renderTable,
+            saveSession: saveSession,
+            showDemotionToast: showDemotionToast,
+            _updateKmlButton: _updateKmlButton,
+            _initFilterUI: _initFilterUI,
+            getSpeedLimit: function() { return parseFloat(document.getElementById('inputSpeedLimit').value) || 63; },
+            getFsdThreshold: function() { return parseFloat(document.getElementById('inputFsdThreshold').value) || 200; },
+            isBatchRunning: function() { return _batchRunning; },
+            setBatchState: function(running, total, done) {
+                _batchRunning = running;
+                _batchTotal = total;
+                _batchDone = done;
             }
-        });
+        };
+    }
+    function handlePerSecFile(event, rowIdx, _onDone) {
+        _handlePerSecFile(event, rowIdx, _onDone, _buildGpsCtx());
+    }
+    function matchPerSecToSNT(perSecArr, sntTimeObj) {
+        return _matchPerSecToSNT(perSecArr, sntTimeObj);
     }
 
     // ==========================================
@@ -1075,127 +866,10 @@ window.jsPDF = jsPDF;
     // CSV DOWNLOAD
     // ==========================================
     // ══════════════════════════════════════════════════════════
-    // FEATURE 1: BATCH PER-SEC UPLOAD
-    // Matches files to violation rows by loco number in filename
+    // BATCH PER-SEC UPLOAD (delegated to src/core/gps-handler.js)
     // ══════════════════════════════════════════════════════════
     async function handleBatchPerSec(event) {
-        var files = Array.from(event.target.files);
-        if (!files.length) return;
-        event.target.value = '';   // reset immediately so same files can be re-selected
-
-        log('📂 Batch upload: ' + files.length + ' file(s) selected — building queue...');
-
-        // ── Build assignment list (file → [rowIdx, ...]) synchronously ────────
-        var assignments = [];   // [{ file, rowIdx, label }]
-        var skipped = 0;
-
-        files.forEach(function(file) {
-            var fname = file.name;
-            var nums  = fname.match(/\d{4,}/g) || [];
-            var rowsForFile = [];
-
-            // Priority 1: Device ID (first number in filename)
-            if (nums.length) {
-                var firstNum = nums[0];
-                analysisResults.forEach(function(r, ri) {
-                    if (String(r.deviceId || '').trim() === firstNum && r.speed > 50) rowsForFile.push(ri);
-                });
-                if (rowsForFile.length)
-                    log('📡 Device ID match: ' + fname + ' → Device ' + firstNum + ' (' + rowsForFile.length + ' row(s) > 50 km/h)');
-            }
-
-            // Priority 2: Loco number fallback
-            if (rowsForFile.length === 0 && nums.length) {
-                var matchedLocos = new Set();
-                nums.forEach(function(n) {
-                    var loco = parseInt(n);
-                    analysisResults.forEach(function(r) { 
-                        if (parseInt(r.loco) === loco && r.speed > 50) matchedLocos.add(loco); 
-                    });
-                });
-                for (var ri2 = 0; ri2 < analysisResults.length; ri2++) {
-                    var r = analysisResults[ri2];
-                    if (matchedLocos.has(parseInt(r.loco)) && r.speed > 50) rowsForFile.push(ri2);
-                }
-                if (rowsForFile.length)
-                    log('🔢 Loco fallback: ' + fname + ' → loco(s) ' + Array.from(matchedLocos).join(',') + ' (' + rowsForFile.length + ' row(s) > 50 km/h)');
-            }
-
-            if (rowsForFile.length === 0) {
-                log('⚠️  Skipped: ' + fname + ' — No matched rows with speed > 50 km/h (nums: ' + nums.join(',') + ')');
-                skipped++;
-                return;
-            }
-
-            rowsForFile.forEach(function(ri) {
-                var r = analysisResults[ri];
-                assignments.push({
-                    file: file,
-                    rowIdx: ri,
-                    label: fname + ' → Dev ' + (r.deviceId || '?') + ' / Loco ' + r.loco +
-                           ' [' + r.station + ' · ' + r.sigNo + ']'
-                });
-            });
-        });
-
-        if (assignments.length === 0) {
-            log('⚠️  No rows matched — nothing to process.');
-            return;
-        }
-
-        // ── Show progress bar ──────────────────────────────────────────────────
-        var prog = document.getElementById('batchProgressBar');
-        var progWrap = document.getElementById('batchProgressWrap');
-        var progLabel = document.getElementById('batchProgressLabel');
-        if (progWrap) {
-            progWrap.style.display = 'block';
-            prog.style.width = '0%';
-            progLabel.textContent = '0 / ' + assignments.length;
-        }
-
-        // ── Serial queue: one file at a time ──────────────────────────────────
-        // Processing 20 files in parallel kills the browser — each PapaParse
-        // callback fires simultaneously, triggers concurrent renderTable() calls,
-        // races on shared analysisResults state, and OOMs the JS heap.
-        _batchRunning = true;
-        _batchTotal   = assignments.length;
-        _batchDone    = 0;
-
-        log('🔄 Processing ' + assignments.length + ' assignment(s) serially (1 at a time)...');
-
-        for (var ai = 0; ai < assignments.length; ai++) {
-            var asgn = assignments[ai];
-            log('  [' + (ai + 1) + '/' + assignments.length + '] ' + asgn.label);
-
-            await new Promise(function(resolve) {
-                handlePerSecFile({ target: { files: [asgn.file] } }, asgn.rowIdx, resolve);
-            });
-
-            _batchDone = ai + 1;
-            if (progWrap) {
-                var pct = Math.round(100 * _batchDone / assignments.length);
-                prog.style.width = pct + '%';
-                progLabel.textContent = _batchDone + ' / ' + assignments.length;
-            }
-
-            // Yield to browser every 5 files to keep UI responsive
-            if ((ai + 1) % 5 === 0) {
-                await new Promise(function(r){ setTimeout(r, 30); });
-            }
-        }
-
-        // ── All done: single renderTable + saveSession ────────────────────────
-        _batchRunning = false;
-        renderTable();
-        saveSession();
-
-        if (progWrap) {
-            prog.style.width = '100%';
-            progLabel.textContent = '✓ Done';
-            setTimeout(function(){ progWrap.style.display = 'none'; }, 2500);
-        }
-
-        log('✅ Batch complete: ' + assignments.length + ' processed, ' + skipped + ' skipped.');
+        await _handleBatchPerSec(event, _buildGpsCtx());
     }
 
     function downloadCSV() {
@@ -1236,37 +910,8 @@ window.jsPDF = jsPDF;
         link.click();
     }
 
-    // ══════════════════════════════════════════════════════════════
-    // EXACT SNT-TIME MATCHING  (±5 s tolerance)
-    // Returns { point, diffMs, quality }
-    //   quality: 'exact'   → diff ≤ 5 s
-    //            'closest' → diff > 5 s  (fallback, show warning)
-    //            'none'    → no per-sec data at all
-    // SNT time is the ground-truth anchor for the violation moment.
-    // ══════════════════════════════════════════════════════════════
-    function matchPerSecToSNT(perSecArr, sntTimeObj) {
-        if (!perSecArr || perSecArr.length === 0) return { point: null, diffMs: null, quality: 'none' };
 
-        var sntMs   = sntTimeObj instanceof Date ? sntTimeObj.getTime() : new Date(sntTimeObj).getTime();
-        var EXACT_MS = 5000;   // ±5 seconds
 
-        var bestIdx  = 0;
-        var bestDiff = Infinity;
-
-        perSecArr.forEach(function(p, i) {
-            if (!p.time) return;
-            var d = Math.abs(p.time.getTime() - sntMs);
-            if (d < bestDiff) { bestDiff = d; bestIdx = i; }
-        });
-
-        var quality = bestDiff <= EXACT_MS ? 'exact' : 'closest';
-        return {
-            point  : perSecArr[bestIdx],
-            idx    : bestIdx,
-            diffMs : bestDiff,
-            quality: quality
-        };
-    }
 
     // ══════════════════════════════════════════════════════════════
     // WORD VIOLATION REPORT GENERATOR
