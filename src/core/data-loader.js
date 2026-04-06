@@ -113,6 +113,13 @@ export function handleXlsxFile(file, ctx) {
 
             // Deliver rows to main via callback
             ctx.onSntData(allRows, file.name);
+            ctx.log("✅ XLSX SNT merged: " + allRows.length + " rows from " + file.name);
+            ctx.onUpdateStatus('snt', true, file.name, allRows.length);
+
+            // Perform cross-validation if all files loaded
+            if (ctx.checkAllLoaded()) {
+                ctx.onCrossValidate();
+            }
         } catch(err) {
             ctx.log("❌ XLSX parse error for " + file.name + ": " + err.message);
             alert("⚠️ Failed to read " + file.name + ": " + err.message);
