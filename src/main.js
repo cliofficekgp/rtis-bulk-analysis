@@ -5,6 +5,8 @@ import html2canvas from 'html2canvas';
 import * as XLSX from 'xlsx';
 import leafletImage from 'leaflet-image';
 import { jsPDF } from 'jspdf';
+import { handleFile as _handleFile, handleXlsxFile as _handleXlsxFile, initFileHandlers } from './core/data-loader.js';
+import { validateRTISData as _validateRTIS, validateSNTData as _validateSNT, validateFSDData as _validateFSD, performCrossValidation as _performCrossValidation, displayValidationReport as _displayValidationReport } from './core/data-validator.js';
 
 window.Papa = Papa;
 window.L = L;
@@ -58,45 +60,48 @@ window.jsPDF = jsPDF;
         div.scrollTop = div.scrollHeight;
     }
 
-    // --- Helper: Detect File Type from CSV Headers ---
-    function detectFileType(data) {
-        if (!data || data.length === 0) return null;
-        
-        // Check first 10 rows to find actual headers (in case of metadata at top)
-        for (var rowIdx = 0; rowIdx < Math.min(10, data.length); rowIdx++) {
-            var row = data[rowIdx];
-            if (!row) continue;
-            
-            var headers = Object.keys(row).map(function(h) { return h.toUpperCase(); });
-            var headerStr = headers.join(' ');
-            var rowValsStr = Object.values(row).map(String).join(' ').toUpperCase();
-            var combinedStr = headerStr + ' ' + rowValsStr;
-            
-            // RTIS Detection: Contains "LOCO" and "LATTITUDE" or "LATITUDE"
-            if ((combinedStr.includes('LOCO') || combinedStr.includes('LOCOMOTIVE')) && 
-                (combinedStr.includes('LATTITUDE') || combinedStr.includes('LATITUDE') || combinedStr.includes('LAT'))) {
-                return 'rtis';
+    // --- Data Loading (delegated to src/core/data-loader.js) ---
+    function _buildLoaderCtx() {
+        return {
+            log: log,
+            filesLoaded: filesLoaded,
+            onRtisData: function(rows) {
+                dataRTIS = rows;
+                filesLoaded.rtis = true;
+                validateRTISData();
+            },
+            onSntData: function(rows, fileName) {
+                dataSNT = dataSNT.concat(rows);
+                sntFileCount++;
+                sntFileNames.push(fileName);
+                filesLoaded.snt = true;
+                validateSNTData();
+            },
+            onFsdData: function(rows) {
+                dataFSD = rows;
+                filesLoaded.fsd = true;
+                validateFSDData();
+            },
+            onValidate: function(type) {
+                if (type === 'rtis') validateRTISData();
+                else if (type === 'snt') validateSNTData();
+                else if (type === 'fsd') validateFSDData();
+            },
+            onCrossValidate: function() {
+                performCrossValidation();
+                displayValidationReport();
+            },
+            onUpdateStatus: function(type, loaded, fileName, rowCount) {
+                updateFileStatus(type, loaded, fileName, rowCount);
+            },
+            checkAllLoaded: function() {
+                return filesLoaded.rtis && filesLoaded.snt && filesLoaded.fsd;
             }
-            
-            // SNT Detection: Contains "STATION" and ("FAULT" or "MESSAGE") and ("OCCURRED" or "TIME")
-            // Also matches new format which has TRAIN SPEED(KMPH) column
-            var hasSntStation = combinedStr.includes('STATION');
-            var hasSntMessage = combinedStr.includes('FAULT') || combinedStr.includes('MESSAGE');
-            var hasSntTime    = combinedStr.includes('OCCUR') || combinedStr.includes('TIME') || combinedStr.includes('SHOWN');
-            var hasSntSpeed   = combinedStr.includes('TRAIN SPEED') || combinedStr.includes('KMPH');
-            if (hasSntStation && (hasSntMessage || hasSntSpeed) && hasSntTime) {
-                return 'snt';
-            }
-            
-            // FSD Detection: Contains "STATION" and "DIRN" or "DIRECTION"
-            if (combinedStr.includes('STATION') && 
-                (combinedStr.includes('DIRN') || combinedStr.includes('DIRECTION'))) {
-                return 'fsd';
-            }
-        }
-        
-        return null;
+        };
     }
+
+    function handleFile(file)     { _handleFile(file, _buildLoaderCtx()); }
+    function handleXlsxFile(file) { _handleXlsxFile(file, _buildLoaderCtx()); }
 
     // --- Helper: Update Status UI ---
     function updateFileStatus(type, loaded, filename, rowCount) {
@@ -141,288 +146,8 @@ window.jsPDF = jsPDF;
         }
     }
 
-    // --- XLSX File Handler (SheetJS) — SNT only, always merges ---
-    function handleXlsxFile(file) {
-        log("📊 Reading XLSX: " + file.name);
-        var reader = new FileReader();
-        reader.onload = function(e) {
-            try {
-                var data = new Uint8Array(e.target.result);
-                var workbook = XLSX.read(data, { type: 'array', cellDates: false, raw: false });
-
-                // Process every sheet in the workbook (some exports split sections per sheet)
-                var allRows = [];
-                workbook.SheetNames.forEach(function(sheetName) {
-                    var sheet = workbook.Sheets[sheetName];
-                    // Get raw array-of-arrays so we can apply our own header-repair logic
-                    var aoaRaw = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' });
-
-                    // ── Find real header row (same logic as SNT CSV repair) ──
-                    var headerRowIdx = -1;
-                    for (var i = 0; i < Math.min(30, aoaRaw.length); i++) {
-                        var rowStr = aoaRaw[i].map(String).join(' ').toUpperCase();
-                        if (rowStr.includes('STATION') &&
-                            (rowStr.includes('FAULT') || rowStr.includes('MESSAGE') || rowStr.includes('TRAIN SPEED') || rowStr.includes('KMPH')) &&
-                            (rowStr.includes('OCCUR') || rowStr.includes('TIME') || rowStr.includes('SHOWN'))) {
-                            headerRowIdx = i;
-                            break;
-                        }
-                    }
-
-                    if (headerRowIdx === -1) {
-                        log("Sheet [" + sheetName + "] - no SNT header row found, skipping.");
-                        return;
-                    }
-
-                    var headers = aoaRaw[headerRowIdx].map(function(h){ return String(h).trim(); });
-                    log("Sheet [" + sheetName + "] - header at row " + (headerRowIdx+1) + ", cols: " + headers.filter(Boolean).join(', '));
-
-                    for (var r = headerRowIdx + 1; r < aoaRaw.length; r++) {
-                        var rowArr = aoaRaw[r];
-                        // Skip fully empty rows
-                        if (!rowArr.some(function(v){ return String(v).trim() !== ''; })) continue;
-                        var obj = {};
-                        headers.forEach(function(h, idx) {
-                            if (h) obj[h] = rowArr[idx] !== undefined ? rowArr[idx] : '';
-                        });
-                        allRows.push(obj);
-                    }
-                });
-
-                if (allRows.length === 0) {
-                    log("❌ " + file.name + " — no SNT data rows found in any sheet.");
-                    alert("⚠️ No SNT data found in " + file.name + ". Please check the file format.");
-                    return;
-                }
-
-                // Confirm it looks like SNT data
-                var fileType = detectFileType(allRows);
-                if (fileType !== 'snt') {
-                    log("File " + file.name + " - detected as [" + (fileType||'unknown') + "], expected SNT.");
-                    alert("⚠️ " + file.name + " does not appear to be an SNT file. Detected: " + (fileType || 'unknown'));
-                    return;
-                }
-
-                // Merge into dataSNT
-                dataSNT = dataSNT.concat(allRows);
-                sntFileCount++;
-                sntFileNames.push(file.name);
-                filesLoaded.snt = true;
-                log("✅ XLSX SNT merged: " + allRows.length + " rows from " + file.name + " (total: " + dataSNT.length + " rows, " + sntFileCount + " files)");
-
-                validateSNTData();
-                updateFileStatus('snt', true, file.name, dataSNT.length);
-
-                if (filesLoaded.rtis && filesLoaded.snt && filesLoaded.fsd) {
-                    performCrossValidation();
-                    displayValidationReport();
-                }
-            } catch(err) {
-                log("❌ XLSX parse error for " + file.name + ": " + err.message);
-                alert("⚠️ Failed to read " + file.name + ": " + err.message);
-            }
-        };
-        reader.readAsArrayBuffer(file);
-    }
-
-    // --- File Loading Logic with Auto-Detection ---
-    function handleFile(file) {
-        log("📁 Reading file: " + file.name);
-
-        Papa.parse(file, {
-            header: true,
-            skipEmptyLines: true,
-            dynamicTyping: true,
-            complete: function(results) {
-                var rawData = results.data;
-                
-                // Detect file type
-                var fileType = detectFileType(rawData);
-                
-                if (!fileType) {
-                    log("❌ Could not detect file type for: " + file.name);
-                    alert("⚠️ Invalid CSV format. Please upload valid RTIS, SNT, or FSD file.");
-                    return;
-                }
-                
-                // For SNT: always merge (no confirm needed). For RTIS/FSD: confirm overwrite.
-                if (filesLoaded[fileType] && fileType !== 'snt') {
-                    var overwrite = confirm(fileType.toUpperCase() + " file already loaded. Do you want to replace it?");
-                    if (!overwrite) return;
-                }
-                
-                // --- SPECIAL FIX FOR SNT FILES WITH GARBAGE HEADERS ---
-                if (fileType === 'snt') {
-                    log("⚠️ Checking for metadata in SNT file...");
-                    
-                    var headerRowIndex = -1;
-                    var foundHeaders = false;
-                    
-                    // Find the row that contains actual column headers (STATION, FAULT MESSAGE/TIME, OCCURRED TIME, etc.)
-                    for (var i = 0; i < Math.min(30, rawData.length); i++) {
-                        var row = rawData[i];
-                        if (!row) continue;
-                        
-                        var headers = Object.keys(row).map(function(h) { return h.toUpperCase(); });
-                        var headerStr = headers.join(' ');
-                        var rowValsStr = Object.values(row).map(String).join(' ').toUpperCase();
-                        var combinedStr = headerStr + ' ' + rowValsStr;
-                        
-                        // Recognise both old format (FAULT MESSAGE + OCCURED TIME)
-                        // and new format (TRAIN SPEED(KMPH) + SHOWN TIME)
-                        var _hasStn  = combinedStr.includes('STATION');
-                        var _hasMsg  = combinedStr.includes('FAULT') || combinedStr.includes('MESSAGE');
-                        var _hasTime = combinedStr.includes('OCCUR') || combinedStr.includes('TIME') || combinedStr.includes('SHOWN');
-                        var _hasSpd  = combinedStr.includes('TRAIN SPEED') || combinedStr.includes('KMPH');
-                        if (_hasStn && (_hasMsg || _hasSpd) && _hasTime) {
-                            headerRowIndex = i;
-                            foundHeaders = true;
-                            log("   -> Found SNT header row at position " + (i + 1));
-                            break;
-                        }
-                    }
-                    
-                    // If metadata found (header row is not at position 0), rebuild the data
-                    if (foundHeaders && headerRowIndex > 0) {
-                        log("   -> Removing " + headerRowIndex + " metadata row(s)...");
-                        
-                        var headerRow = rawData[headerRowIndex];
-                        var newHeaders = Object.values(headerRow).map(function(v) { 
-                            return String(v || '').trim(); 
-                        });
-                        
-                        var cleanData = [];
-                        for (var j = headerRowIndex + 1; j < rawData.length; j++) {
-                            var oldRow = rawData[j];
-                            if (!oldRow) continue;
-                            
-                            var oldVals = Object.values(oldRow).map(function(v) { return v; });
-                            var newRow = {};
-                            
-                            for (var k = 0; k < newHeaders.length; k++) {
-                                if (newHeaders[k]) {
-                                    newRow[newHeaders[k]] = oldVals[k];
-                                }
-                            }
-                            
-                            // Only include rows that have actual data (not empty)
-                            if (Object.values(newRow).some(function(v) { return v; })) {
-                                cleanData.push(newRow);
-                            }
-                        }
-                        
-                        rawData = cleanData;
-                        log("   -> SNT Repaired: " + rawData.length + " clean data rows ready");
-                    }
-                }
-                
-                // Store data
-                if (fileType === 'rtis') {
-                    dataRTIS = rawData;
-                    filesLoaded.rtis = true;
-                    validateRTISData();
-                } else if (fileType === 'snt') {
-                    // SNT always merges — accumulate from all files
-                    dataSNT = dataSNT.concat(rawData);
-                    sntFileCount++;
-                    sntFileNames.push(file.name);
-                    filesLoaded.snt = true;
-                    validateSNTData();
-                } else if (fileType === 'fsd') {
-                    dataFSD = rawData;
-                    filesLoaded.fsd = true;
-                    validateFSDData();
-                }
-                
-                log("✅ Loaded " + fileType.toUpperCase() + ": " + rawData.length + " rows");
-                updateFileStatus(fileType, true, file.name, rawData.length);
-
-                // Perform cross-validation if all files loaded
-                if (filesLoaded.rtis && filesLoaded.snt && filesLoaded.fsd) {
-                    performCrossValidation();
-                    displayValidationReport();
-                }
-            }
-        });
-    }
-
-    // --- Setup Drag & Drop and File Input ---
-    document.addEventListener('DOMContentLoaded', function() {
-        // Auto-restore session from localStorage if available
-        setTimeout(function() {
-            if (typeof loadSession === 'function') {
-                var restored = loadSession();
-                if (restored) log('✅ Session auto-restored. Re-upload per-sec files to restore speed data.');
-            }
-        }, 400);
-
-        var dropZone = document.getElementById('dropZone');
-        var fileInput = document.getElementById('fileInput');
-        var btnRun = document.getElementById('btnRun');
-        
-        if (!dropZone || !fileInput) {
-            console.error('Drop zone or file input element not found');
-            return;
-        }
-        
-        // Ensure Run button is disabled on load
-        if (btnRun) {
-            btnRun.disabled = true;
-        }
-        
-        // Click to browse
-        dropZone.addEventListener('click', function() {
-            fileInput.click();
-        });
-        
-        // Prevent default drag behaviors
-        ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(function(eventName) {
-            dropZone.addEventListener(eventName, function(e) {
-                e.preventDefault();
-                e.stopPropagation();
-            }, false);
-        });
-        
-        // Highlight drop zone when dragging over it
-        ['dragenter', 'dragover'].forEach(function(eventName) {
-            dropZone.addEventListener(eventName, function() {
-                dropZone.classList.add('border-blue-500', 'bg-blue-50');
-            }, false);
-        });
-        
-        ['dragleave', 'drop'].forEach(function(eventName) {
-            dropZone.addEventListener(eventName, function() {
-                dropZone.classList.remove('border-blue-500', 'bg-blue-50');
-            }, false);
-        });
-        
-        // Handle dropped files
-        dropZone.addEventListener('drop', function(e) {
-            var files = e.dataTransfer.files;
-            for (var i = 0; i < files.length; i++) {
-                var fname = files[i].name.toLowerCase();
-                if (fname.endsWith('.csv')) {
-                    handleFile(files[i]);
-                } else if (fname.endsWith('.xlsx') || fname.endsWith('.xls')) {
-                    handleXlsxFile(files[i]);
-                }
-            }
-        });
-
-        // Handle selected files
-        fileInput.addEventListener('change', function(e) {
-            var files = e.target.files;
-            for (var i = 0; i < files.length; i++) {
-                var fname = files[i].name.toLowerCase();
-                if (fname.endsWith('.csv')) {
-                    handleFile(files[i]);
-                } else if (fname.endsWith('.xlsx') || fname.endsWith('.xls')) {
-                    handleXlsxFile(files[i]);
-                }
-            }
-            fileInput.value = ''; // Reset input to allow re-uploading same file
-        });
-    });
+    // --- Init Drag & Drop file handlers (delegated to data-loader.js) ---
+    initFileHandlers(handleFile, handleXlsxFile, loadSession, log);
 
     // --- Helper: Robust Date Parser ---
     function parseSmartDate(dateStr) {
@@ -696,296 +421,14 @@ window.jsPDF = jsPDF;
     }
 
     // --- Data Validation Functions ---
-    function validateRTISData() {
-        var report = {
-            totalRows: dataRTIS.length,
-            invalidGPS: 0,
-            invalidDates: 0,
-            missingSpeed: 0,
-            missingStation: 0,
-            uniqueStations: new Set(),
-            dateRange: { min: null, max: null }
-        };
-
-        dataRTIS.forEach(function(row) {
-            var lat = parseFloat(getCol(row, ['Latitude', 'Lattitude', 'LAT', 'Lat']));
-            var lon = parseFloat(getCol(row, ['Longitude', 'LON', 'Lon']));
-            var speed = getCol(row, ['Speed', 'SPEED']);
-            var station = getCol(row, ['Station', 'STATION', 'STN_CODE']);
-            var timeRaw = getCol(row, ['Event Time', 'TIME', 'EventTime', 'Date']);
-
-            if (!isValidGPS(lat, lon)) report.invalidGPS++;
-            if (!speed && speed !== 0) report.missingSpeed++;
-            if (!station) report.missingStation++;
-            else {
-                station = cleanStationName(station);
-                if (station) report.uniqueStations.add(station);
-            }
-
-            var date = parseSmartDate(timeRaw);
-            if (!date) {
-                report.invalidDates++;
-            } else {
-                if (!report.dateRange.min || date < report.dateRange.min) report.dateRange.min = date;
-                if (!report.dateRange.max || date > report.dateRange.max) report.dateRange.max = date;
-            }
-        });
-
-        validationReport.rtis = report;
-        return report;
-    }
-
-    function validateSNTData() {
-        var report = {
-            totalRows: dataSNT.length,
-            invalidDates: 0,
-            missingStation: 0,
-            missingMessage: 0,
-            noSignalID: 0,
-            uniqueStations: new Set(),
-            uniqueSignals: new Set(),
-            dateRange: { min: null, max: null }
-        };
-
-        dataSNT.forEach(function(row) {
-            var station = getCol(row, ['STATION', 'Station', 'STN_CODE']);
-            var message = getCol(row, ['FAULT MESSAGE', 'Message', 'MESSAGE', 'Log']);
-            var timeRaw = getCol(row, ['OCCURED TIME', 'TIME', 'Date', 'Time', 'SHOWN TIME']);
-            var sntSpd  = getCol(row, ['TRAIN SPEED(KMPH)', 'TRAIN SPEED (KMPH)', 'TRAINSPEED', 'SPEED(KMPH)']);
-            if (sntSpd !== null && sntSpd !== undefined && !isNaN(parseFloat(sntSpd))) report.hasSntSpeed = (report.hasSntSpeed || 0) + 1;
-
-            if (!station) report.missingStation++;
-            else {
-                station = cleanStationName(station);
-                if (station) report.uniqueStations.add(station);
-            }
-
-            if (!message) report.missingMessage++;
-            else {
-                var sigNum = extractSignalNumber(message);
-                if (!sigNum) report.noSignalID++;
-                else report.uniqueSignals.add('S' + sigNum);
-            }
-
-            var date = parseSmartDate(timeRaw);
-            if (!date) {
-                report.invalidDates++;
-            } else {
-                if (!report.dateRange.min || date < report.dateRange.min) report.dateRange.min = date;
-                if (!report.dateRange.max || date > report.dateRange.max) report.dateRange.max = date;
-            }
-        });
-
-        validationReport.snt = report;
-        return report;
-    }
-
-    function validateFSDData() {
-        var report = {
-            totalRows: dataFSD.length,
-            invalidGPS: 0,
-            missingStation: 0,
-            missingSignal: 0,
-            missingDirection: 0,
-            uniqueStations: new Set(),
-            uniqueSignals: new Set()
-        };
-
-        dataFSD.forEach(function(row) {
-            var station = getCol(row, ['Station', 'STATION', 'STN_CODE', 'Station Name']);
-            var sigNo = getCol(row, ['SIGNUMBER', 'Signal', 'SIGNAL', 'Signal No', 'SIG_ID']);
-            var lat = getCol(row, ['Latitude', 'Lattitude', 'LAT', 'Lat', 'GPS_LAT']);
-            var lon = getCol(row, ['Longitude', 'LON', 'Lon', 'GPS_LON']);
-            var dir = getCol(row, ['DIRN', 'Direction', 'DIR']);
-
-            if (!station) report.missingStation++;
-            else {
-                station = cleanStationName(station);
-                if (station) report.uniqueStations.add(station);
-            }
-
-            if (!sigNo) report.missingSignal++;
-            else report.uniqueSignals.add(String(sigNo).trim());
-
-            if (!isValidGPS(lat, lon)) report.invalidGPS++;
-            if (!dir) report.missingDirection++;
-        });
-
-        validationReport.fsd = report;
-        return report;
-    }
-
+    // --- Data Validation (delegated to src/core/data-validator.js) ---
+    function validateRTISData() { validationReport.rtis = _validateRTIS(dataRTIS); }
+    function validateSNTData()  { validationReport.snt  = _validateSNT(dataSNT); }
+    function validateFSDData()  { validationReport.fsd  = _validateFSD(dataFSD); }
     function performCrossValidation() {
-        var report = {
-            stationsInRTISNotInFSD: [],
-            stationsInSNTNotInFSD: [],
-            signalsInSNTNotInFSD: [],
-            rtisFuzzyMatches: []
-        };
-
-        // Build FSD station map for fuzzy matching
-        var fsdStationList = Array.from(validationReport.fsd.uniqueStations);
-        
-        // Create a temporary FSD map with GPS for fuzzy matching
-        var tempFSDMap = {};
-        dataFSD.forEach(function(row) {
-            var station = getCol(row, ['Station', 'STATION', 'STN_CODE', 'Station Name']);
-            var lat = getCol(row, ['Latitude', 'Lattitude', 'LAT', 'Lat', 'GPS_LAT']);
-            var lon = getCol(row, ['Longitude', 'LON', 'Lon', 'GPS_LON']);
-            var dir = getCol(row, ['DIRN', 'Direction', 'DIR']);
-            
-            if (station) {
-                station = cleanStationName(station);
-                if (!station) return;
-                
-                if (!tempFSDMap[station]) tempFSDMap[station] = {UP: [], DN: []};
-                
-                var direction = String(dir || '').toUpperCase().trim();
-                if (direction === 'UP' || direction === 'DN') {
-                    tempFSDMap[station][direction].push({
-                        lat: parseFloat(lat),
-                        lon: parseFloat(lon)
-                    });
-                }
-            }
-        });
-
-        // Check RTIS stations against FSD with fuzzy matching
-        validationReport.rtis.uniqueStations.forEach(function(stn) {
-            if (!validationReport.fsd.uniqueStations.has(stn)) {
-                // Try fuzzy match
-                var rtisGPS = null;
-                for (var i = 0; i < dataRTIS.length; i++) {
-                    var rowStn = getCol(dataRTIS[i], ['Station', 'STATION', 'STN_CODE']);
-                    if (cleanStationName(rowStn) === stn) {
-                        var lat = parseFloat(getCol(dataRTIS[i], ['Latitude', 'Lattitude', 'LAT', 'Lat']));
-                        var lon = parseFloat(getCol(dataRTIS[i], ['Longitude', 'LON', 'Lon']));
-                        if (isValidGPS(lat, lon)) {
-                            rtisGPS = {lat: lat, lon: lon};
-                            break;
-                        }
-                    }
-                }
-                
-                if (rtisGPS) {
-                    var fuzzyMatch = findFuzzyStationMatch(stn, rtisGPS.lat, rtisGPS.lon, tempFSDMap);
-                    if (fuzzyMatch) {
-                        report.rtisFuzzyMatches.push({
-                            rtis: stn,
-                            fsd: fuzzyMatch.fsdStation,
-                            distance: fuzzyMatch.distance
-                        });
-                    } else {
-                        report.stationsInRTISNotInFSD.push(stn);
-                    }
-                } else {
-                    report.stationsInRTISNotInFSD.push(stn);
-                }
-            }
-        });
-
-        // Check SNT stations against FSD
-        validationReport.snt.uniqueStations.forEach(function(stn) {
-            if (!validationReport.fsd.uniqueStations.has(stn)) {
-                report.stationsInSNTNotInFSD.push(stn);
-            }
-        });
-
-        validationReport.cross = report;
-
-        // --- Date Range Overlap Check ---
-        var rtisMin = validationReport.rtis.dateRange && validationReport.rtis.dateRange.min;
-        var rtisMax = validationReport.rtis.dateRange && validationReport.rtis.dateRange.max;
-        var sntMin  = validationReport.snt.dateRange  && validationReport.snt.dateRange.min;
-        var sntMax  = validationReport.snt.dateRange  && validationReport.snt.dateRange.max;
-
-        if (rtisMin && rtisMax && sntMin && sntMax) {
-            var overlapOk = rtisMin <= sntMax && sntMin <= rtisMax;
-            var warn = document.getElementById('dateOverlapWarning');
-            var detail = document.getElementById('dateOverlapDetail');
-            if (!overlapOk) {
-                warn.classList.remove('hidden');
-                detail.innerHTML =
-                    'RTIS range: <b>' + rtisMin.toLocaleDateString() + ' – ' + rtisMax.toLocaleDateString() + '</b> &nbsp;|&nbsp; ' +
-                    'SNT range: <b>' + sntMin.toLocaleDateString() + ' – ' + sntMax.toLocaleDateString() + '</b><br>' +
-                    'These date ranges do not overlap. Analysis will likely return zero matches. Please verify your files cover the same date period.';
-                log("🔴 WARNING: RTIS and SNT date ranges do not overlap! Matches will be empty.");
-            } else {
-                warn.classList.add('hidden');
-                log("✅ Date Range Check: RTIS and SNT dates overlap correctly.");
-            }
-        }
-
-        return report;
+        validationReport.cross = _performCrossValidation(dataRTIS, dataFSD, validationReport, findFuzzyStationMatch, log);
     }
-
-    function displayValidationReport() {
-        var panel = document.getElementById('validationPanel');
-        panel.classList.remove('hidden');
-
-        // RTIS Validation
-        var rtisDiv = document.getElementById('rtisValidation');
-        var rtis = validationReport.rtis;
-        rtisDiv.innerHTML = `
-            <div>Total Rows: <span class="font-semibold">${rtis.totalRows}</span></div>
-            <div>Unique Stations: <span class="font-semibold">${rtis.uniqueStations.size}</span></div>
-            ${rtis.invalidGPS > 0 ? '<div class="error-badge">⚠️ Invalid GPS: ' + rtis.invalidGPS + '</div>' : '<div class="success-badge">✓ All GPS Valid</div>'}
-            ${rtis.invalidDates > 0 ? '<div class="error-badge">⚠️ Invalid Dates: ' + rtis.invalidDates + '</div>' : '<div class="success-badge">✓ All Dates Valid</div>'}
-            ${rtis.missingSpeed > 0 ? '<div class="warning-badge">Missing Speed: ' + rtis.missingSpeed + '</div>' : ''}
-            ${rtis.dateRange.min ? '<div class="text-gray-600 mt-1">Date Range: ' + rtis.dateRange.min.toLocaleDateString() + ' to ' + rtis.dateRange.max.toLocaleDateString() + '</div>' : ''}
-        `;
-
-        // SNT Validation
-        var sntDiv = document.getElementById('sntValidation');
-        var snt = validationReport.snt;
-        sntDiv.innerHTML = `
-            <div>Total Rows: <span class="font-semibold">${snt.totalRows}</span></div>
-            <div>Unique Stations: <span class="font-semibold">${snt.uniqueStations.size}</span></div>
-            <div>Unique Signals: <span class="font-semibold">${snt.uniqueSignals.size}</span></div>
-            ${snt.noSignalID > 0 ? '<div class="warning-badge">No Signal ID: ' + snt.noSignalID + '</div>' : '<div class="success-badge">✓ All Have Signal ID</div>'}
-            ${snt.invalidDates > 0 ? '<div class="error-badge">⚠️ Invalid Dates: ' + snt.invalidDates + '</div>' : '<div class="success-badge">✓ All Dates Valid</div>'}
-            ${snt.dateRange.min ? '<div class="text-gray-600 mt-1">Date Range: ' + snt.dateRange.min.toLocaleDateString() + ' to ' + snt.dateRange.max.toLocaleDateString() + '</div>' : ''}
-        `;
-
-        // FSD Validation
-        var fsdDiv = document.getElementById('fsdValidation');
-        var fsd = validationReport.fsd;
-        fsdDiv.innerHTML = `
-            <div>Total Rows: <span class="font-semibold">${fsd.totalRows}</span></div>
-            <div>Unique Stations: <span class="font-semibold">${fsd.uniqueStations.size}</span></div>
-            <div>Unique Signals: <span class="font-semibold">${fsd.uniqueSignals.size}</span></div>
-            ${fsd.invalidGPS > 0 ? '<div class="error-badge">⚠️ Invalid GPS: ' + fsd.invalidGPS + '</div>' : '<div class="success-badge">✓ All GPS Valid</div>'}
-            ${fsd.missingDirection > 0 ? '<div class="warning-badge">Missing Direction: ' + fsd.missingDirection + '</div>' : '<div class="success-badge">✓ All Have Direction</div>'}
-        `;
-
-        // Cross Validation
-        var crossDiv = document.getElementById('crossValidation');
-        var cross = validationReport.cross;
-        var warnings = [];
-        
-        if (cross.rtisFuzzyMatches && cross.rtisFuzzyMatches.length > 0) {
-            var fuzzyList = cross.rtisFuzzyMatches.map(function(m) {
-                return m.rtis + '→' + m.fsd + ' (' + (m.distance * 1000).toFixed(0) + 'm)';
-            }).join(', ');
-            warnings.push('<div class="mb-2"><span class="warning-badge">🔍</span> <strong>' + cross.rtisFuzzyMatches.length + ' RTIS stations matched by proximity:</strong> ' + fuzzyList + '</div>');
-        }
-        
-        if (cross.stationsInRTISNotInFSD.length > 0) {
-            warnings.push('<div class="mb-2"><span class="error-badge">⚠️</span> <strong>' + cross.stationsInRTISNotInFSD.length + ' RTIS stations not in FSD:</strong> ' + cross.stationsInRTISNotInFSD.join(', ') + '</div>');
-        }
-        
-        if (cross.stationsInSNTNotInFSD.length > 0) {
-            warnings.push('<div class="mb-2"><span class="error-badge">⚠️</span> <strong>' + cross.stationsInSNTNotInFSD.length + ' SNT stations not in FSD:</strong> ' + cross.stationsInSNTNotInFSD.join(', ') + '</div>');
-        }
-
-        if (warnings.length === 0) {
-            crossDiv.innerHTML = '<div class="success-badge">✓ All stations cross-referenced successfully</div>';
-        } else {
-            crossDiv.innerHTML = '<div class="font-semibold mb-2">Cross-Reference Issues:</div>' + warnings.join('');
-        }
-
-        log("✅ Data Validation Complete");
-    }
+    function displayValidationReport() { _displayValidationReport(validationReport, log); }
 
     // --- Helper: Compute direction of travel from sequential GPS pings ---
     // Returns 'UP', 'DN', or null based on the bearing between two consecutive RTIS pings
