@@ -153,10 +153,26 @@ export function handlePerSecFile(event, rowIdx, _onDone, ctx) {
                         }
                     }
 
-                    // ── STEP 3: DEMOTION — violation row that is far from FSD signal ────────
+                    // ── STEP 3a: DEMOTION — violation/ambiguous row with per-sec speed UNDER limit ────
                     var classChanged = false;
-                    if (speedPs !== null && speedPs > speedLimit &&
-                        (row.resultClass === 'violation' || row.resultClass === 'violation-multi') &&
+                    if (speedPs !== null && speedPs <= speedLimit &&
+                        (row.resultClass === 'violation' || row.resultClass === 'violation-multi' || row.resultClass === 'ambiguous')) {
+
+                        row.resultClass   = 'complied';
+                        row.result        = 'Complied';
+                        row.perSecDemoted = true;
+                        row.perSecDemotedReason =
+                            'Per-sec GPS speed at SNT time is ' + speedPs +
+                            ' km/h — under speed limit ' + speedLimit +
+                            ' km/h. RTIS speed (' + row.speed + ' km/h) was at minute precision.';
+                        ctx.log('✅ DEMOTED to Complied (speed): per-sec ' + speedPs + ' km/h ≤ ' + speedLimit + ' km/h, row ' + rowIdx);
+                        ctx.showDemotionToast(row.trainNo, psDistToFsd, trainDir, row.perSecDemotedReason);
+                        classChanged = true;
+                    }
+
+                    // ── STEP 3b: DEMOTION — violation/ambiguous row that is far from FSD signal ────────
+                    if (!classChanged && speedPs !== null && speedPs > speedLimit &&
+                        (row.resultClass === 'violation' || row.resultClass === 'violation-multi' || row.resultClass === 'ambiguous') &&
                         psDistToFsd !== null && psDistToFsd > fsdThreshold) {
 
                         row.resultClass   = 'complied';
@@ -166,7 +182,7 @@ export function handlePerSecFile(event, rowIdx, _onDone, ctx) {
                             'Per-sec GPS at SNT time is ' + psDistToFsd.toFixed(0) +
                             ' m from FSD signal (' + trainDir + ') — exceeds threshold ' +
                             fsdThreshold + ' m. Train was not at the signal when SNT fired.';
-                        ctx.log('✅ DEMOTED to Complied: dist ' + psDistToFsd.toFixed(0) + 'm > ' + fsdThreshold + 'm, row ' + rowIdx);
+                        ctx.log('✅ DEMOTED to Complied (distance): dist ' + psDistToFsd.toFixed(0) + 'm > ' + fsdThreshold + 'm, row ' + rowIdx);
                         ctx.showDemotionToast(row.trainNo, psDistToFsd, trainDir, row.perSecDemotedReason);
                         classChanged = true;
                     }

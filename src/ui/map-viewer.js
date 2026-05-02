@@ -29,8 +29,9 @@ export function openMap(resultIdx, analysisResults, perSecondData) {
     document.getElementById('mapModal').classList.add('open');
     document.getElementById('mapTitle').innerHTML =
         'Train ' + row.trainNo + ' &mdash; ' + row.station + ' &mdash; ' + row.sigNo + dirBadge;
+    var _mapResultLabel = (row.resultClass === 'ambiguous' && ((row.speedPerSec !== null && row.speedPerSec !== undefined ? row.speedPerSec : row.speed) > (parseFloat(document.getElementById('inputSpeedLimit').value) || 63))) ? 'VIOLATION' : row.result;
     document.getElementById('mapSubtitle').innerText =
-        row.result + ' | Speed: ' + (row.speedPerSec !== null && row.speedPerSec !== undefined ? row.speedPerSec : row.speed) + ' km/h | SNT: ' + row.signalTime;
+        _mapResultLabel + ' | Speed: ' + (row.speedPerSec !== null && row.speedPerSec !== undefined ? row.speedPerSec : row.speed) + ' km/h | SNT: ' + row.signalTime;
 
     setTimeout(function() { buildMap(row, resultIdx, analysisResults, perSecondData); }, 80);
 }
@@ -199,6 +200,8 @@ function buildMap(row, resultIdx, analysisResults, perSecondData) {
     // Violation popup builder
     function violPopupHTML() {
         var sc = speedAtSignal > speedLimit ? '#dc2626' : '#16a34a';
+        var isAmbigOverspeed = (row.resultClass === 'ambiguous' && speedAtSignal > speedLimit);
+        var displayLabel = (isAmbigOverspeed) ? 'VIOLATION' : row.result;
         var matchLine = '';
         if      (matchQuality === 'exact')   matchLine = '<br><span style="color:#16a34a;font-size:0.72rem">✓ Exact SNT match (Δ' + diffSecStr + ')</span>';
         else if (matchQuality === 'closest') matchLine = '<br><span style="color:#b45309;font-size:0.72rem">⚠ Closest point (Δ' + diffSecStr + ' — outside ±5s)</span>';
@@ -213,7 +216,7 @@ function buildMap(row, resultIdx, analysisResults, perSecondData) {
             : (distToRtisM !== null ? '<br>🚂 Dist to RTIS H event: <b>&lt;1 m</b> (same point)' : '');
 
         return "<div class='popup-violation'>" +
-            "<strong>🚨 " + row.result + "</strong><hr style='margin:4px 0'>" +
+            "<strong>🚨 " + displayLabel + "</strong><hr style='margin:4px 0'>" +
             "Train: <b>" + row.trainNo + "</b><br>" +
             "SNT Signal: <b>" + row.sigNo + "</b> @ " + row.signalTime + "<br>" +
             "Speed @ SNT: <b style='color:" + sc + "'>" + speedAtSignal + " km/h</b><br>" +
@@ -231,7 +234,7 @@ function buildMap(row, resultIdx, analysisResults, perSecondData) {
             radius:14, fillColor: row.resultClass==='complied'?'#22c55e':'#ef4444',
             color:'#1e293b', weight:3, fillOpacity:0.9
         }).addTo(leafletMap)
-        .bindTooltip(row.result + ' · ' + row.speed + ' km/h', {permanent:false});
+        .bindTooltip((function(){ var _l = (row.resultClass === 'ambiguous' && row.speed > speedLimit) ? 'VIOLATION' : row.result; return _l + ' · ' + row.speed + ' km/h'; })(), {permanent:false});
         if (window._showViolPanel) window._showViolPanel(row, speedAtSignal, speedLimit, matchQuality, diffSecStr, distToFsdM, nearestFsdSig, distToRtisM);
 
     } else {
@@ -284,7 +287,7 @@ function buildMap(row, resultIdx, analysisResults, perSecondData) {
             var spCol  = (pSpeed !== null && pSpeed > speedLimit) ? '#dc2626' : '#16a34a';
             var m = L.circleMarker([p.lat, p.lon], opts).addTo(leafletMap);
             if (isViol) {
-                m.bindTooltip(row.result + ' · ' + speedAtSignal + ' km/h', {permanent:false});
+                m.bindTooltip((function(){ var _l = (row.resultClass === 'ambiguous' && speedAtSignal > speedLimit) ? 'VIOLATION' : row.result; return _l + ' · ' + speedAtSignal + ' km/h'; })(), {permanent:false});
                 if (window._showViolPanel) window._showViolPanel(row, speedAtSignal, speedLimit, matchQuality, diffSecStr, distToFsdM, nearestFsdSig, distToRtisM);
             } else {
                 m.bindPopup(

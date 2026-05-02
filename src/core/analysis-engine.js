@@ -17,10 +17,11 @@ export function executeAnalysis(dataRTIS, dataSNT, dataFSD, stationMappingCache,
 
     var timeWindow = parseInt(document.getElementById('inputTimeWindow').value);
     var speedLimit = parseFloat(document.getElementById('inputSpeedLimit').value);
-    var maxDist    = parseFloat(document.getElementById('inputMaxDist').value);
+    var maxDistM   = parseFloat(document.getElementById('inputMaxDist').value);   // now in meters
+    var maxDist    = maxDistM / 1000;                                             // convert to km for internal use
 
     log('🚀 === ANALYSIS STARTED ===');
-    log('⚙️  Configuration: TimeWindow=' + timeWindow + 's, SpeedLimit=' + speedLimit + 'km/h, MaxDist=' + maxDist + 'km');
+    log('⚙️  Configuration: TimeWindow=' + timeWindow + 's, SpeedLimit=' + speedLimit + 'km/h, MaxDist=' + maxDistM + 'm');
 
     // ── Reset ────────────────────────────────────────────────────
     var cntTotal = 0, cntNoTrain = 0, cntFuzzyMatches = 0;
@@ -257,7 +258,7 @@ export function executeAnalysis(dataRTIS, dataSNT, dataFSD, stationMappingCache,
             return;
         }
 
-        var maxDistKm = parseFloat(document.getElementById('inputMaxDist').value) || 5.0;
+        var maxDistKm = (parseFloat(document.getElementById('inputMaxDist').value) || 100) / 1000;  // input is meters, convert to km
         candidates = candidates.filter(function(evt) {
             if (!isValidGPS(evt.lat, evt.lon)) return false;
             var minD = Infinity;
@@ -274,7 +275,7 @@ export function executeAnalysis(dataRTIS, dataSNT, dataFSD, stationMappingCache,
             cntNoTrain++;
             noTrainResults.push({ station:originalStation, rtisTime:'—',
                 signalTime:sntTime.toLocaleTimeString(), sigNo:sigID, dirSig:computedDir,
-                reason:'All RTIS events beyond Max Dist (' + maxDistKm + ' km)' });
+                reason:'All RTIS events beyond Max Dist (' + (maxDistKm * 1000) + ' m)' });
             return;
         }
 

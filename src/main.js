@@ -527,6 +527,15 @@ window.jsPDF = jsPDF;
         }).join('') + '</tr>';
     }
 
+    function _updateKmlButton() {
+        var btn = document.getElementById('btnExportKML');
+        if (!btn) return;
+        var hasAny = analysisResults.some(function(_, idx) {
+            return perSecondData[idx] && perSecondData[idx].length > 0;
+        });
+        btn.style.display = hasAny ? 'inline-block' : 'none';
+    }
+
     function renderTable() {
         ['violation','complied','ambiguous','notrain'].forEach(buildTableHeader);
 
@@ -844,7 +853,7 @@ window.jsPDF = jsPDF;
     // ==========================================
     // MAP VIEWER (Extracted to src/ui/map-viewer.js)
     // ==========================================
-    import { openMap as _openMap, closeMap as _closeMap, showDemotionToast as _showDemotionToast, closeDemotionToast as _closeDemotionToast, initToastListeners } from './ui/map-viewer.js';
+    import { openMap as _openMap, closeMap as _closeMap, showDemotionToast as _showDemotionToast, closeDemotionToast as _closeDemotionToast, initToastListeners, getLeafletMap } from './ui/map-viewer.js';
 
     // Expose dataFSD and helpers to the map module via window bridges
     window._dataFSD       = dataFSD;
@@ -918,632 +927,150 @@ window.jsPDF = jsPDF;
     // One page per violation: info table + map screenshot + speed graph
     // ══════════════════════════════════════════════════════════════
 
-    function _reportProgress(label, pct) {
-        document.getElementById('reportProgressLabel').textContent = label;
-        document.getElementById('reportProgressBar').style.width = pct + '%';
-        document.getElementById('reportProgressPct').textContent = pct + '%';
-    }
-
     // ══════════════════════════════════════════════════════════════
-    // MAP CAPTURE — Esri REST Export API method
-    //
-    // Steps:
-    //  1. Calculate a tight bounding box around the violation point
-    //  2. Fetch satellite PNG directly from Esri's MapServer/export
-    //     endpoint — no Leaflet, no html2canvas, no tile timing
-    //  3. Draw the base image onto a canvas
-    //  4. Project lat/lon → pixel using the bounding box
-    //  5. Draw per-sec track polyline + FSD signal markers + violation pin
-    //  6. Return dataURL — always clean, always aligned
+    // PDF REPORT SYSTEM (Extracted to src/ui/pdf-generator.js and src/ui/pdf-capture.js)
     // ══════════════════════════════════════════════════════════════
-    function _captureMapForRow(row, resultIdx) {
-        return new Promise(function(resolve) {
-            var speedLimit   = parseFloat(document.getElementById('inputSpeedLimit').value) || 63;
-            var hasPersec    = perSecondData[resultIdx] && perSecondData[resultIdx].length > 0;
-            var cleanStation = row.fsdStation || cleanStationName(row.station.split(' → ')[0]);
-
-            // ── Resolve violation coordinates ─────────────────────────────
-            var sntDateObj = row.sntTimeISO ? new Date(row.sntTimeISO) : (function() {
-                var base = row.violationTime instanceof Date ? row.violationTime : new Date(row.violationTimeStr);
-                var d = new Date(base);
-                var tp = (row.signalTime || '').match(/(\d{1,2}):(\d{2})(?::(\d{2}))?/);
-                if (tp) d.setHours(parseInt(tp[1]), parseInt(tp[2]), parseInt(tp[3]||0), 0);
-                return d;
-            })();
-            var matchResult = row.perSecMatch || (hasPersec ? matchPerSecToSNT(perSecondData[resultIdx], sntDateObj) : null);
-
-            var violLat, violLon, speedAtSignal;
-            var sntMatchedIdx = 0;
-            if (hasPersec && matchResult && matchResult.point && isValidGPS(matchResult.point.lat, matchResult.point.lon)) {
-                violLat       = matchResult.point.lat;
-                violLon       = matchResult.point.lon;
-                speedAtSignal = !isNaN(matchResult.point.speed) ? matchResult.point.speed : row.speed;
-                sntMatchedIdx = matchResult.idx || 0;
-            } else {
-                violLat       = row.violationLat;
-                violLon       = row.violationLon;
-                speedAtSignal = (row.speedPerSec != null) ? row.speedPerSec : row.speed;
-            }
-            if (!isValidGPS(violLat, violLon)) {
-                resolve(_mapFallbackCanvas(row, null, null, speedAtSignal, speedLimit)); return;
-            }
-
-            // ── Collect FSD signals — live data or row cache (session restore) ──
-            var fsdSignals = [];
-            if (dataFSD.length > 0) {
-                dataFSD.forEach(function(r) {
-                    var stn = cleanStationName(getCol(r, ['Station','STATION','STN_CODE','Station Name']));
-                    if (stn !== cleanStation) return;
-                    var lat = parseFloat(getCol(r, ['Latitude','Lattitude','LAT','Lat','GPS_LAT']));
-                    var lon = parseFloat(getCol(r, ['Longitude','LON','Lon','GPS_LON']));
-                    var dir = String(getCol(r, ['DIRN','Direction','DIR']) || '').toUpperCase().trim();
-                    var sigNo = getCol(r, ['SIGNUMBER','Signal','SIGNAL','Signal No','SIG_ID']);
-                    if (!isValidGPS(lat, lon)) return;
-                    fsdSignals.push({ lat:lat, lon:lon, dir:dir, sigNo:sigNo });
-                });
-            }
-            if (fsdSignals.length === 0 && row.cachedFsdSignals && row.cachedFsdSignals.length) {
-                fsdSignals = row.cachedFsdSignals.filter(function(s){ return isValidGPS(s.lat, s.lon); });
-            }
-
-            // ── Build per-sec track window (same ±40 as buildMap) ─────────
-            var trackPts = [], localViolIdx = -1;
-            if (hasPersec && perSecondData[resultIdx]) {
-                var allPts = perSecondData[resultIdx];
-                if (!matchResult || matchResult.idx === undefined) {
-                    var bd = Infinity;
-                    allPts.forEach(function(p,i){ var d=Math.abs(p.time-sntDateObj); if(d<bd){bd=d;sntMatchedIdx=i;} });
-                }
-                // Use ±80 points so context is available even at tight zoom
-                var s2 = Math.max(0, sntMatchedIdx - 80), e2 = Math.min(allPts.length-1, sntMatchedIdx+80);
-                trackPts    = allPts.slice(s2, e2+1);
-                localViolIdx = sntMatchedIdx - s2;
-            }
-
-            // ── Image canvas size ──────────────────────────────────────────
-            var IW = 860, IH = 420;
-
-            // ── Web Mercator helpers (EPSG:3857) ───────────────────────────
-            // CRITICAL: bbox AND pixel projection must use the same CRS.
-            // Esri tiles are EPSG:3857. Using lat/lon linear projection causes
-            // track-drift because Mercator Y is non-linear with latitude.
-            function _mercX(lon) { return lon * 20037508.342789244 / 180; }
-            function _mercY(lat) {
-                var r = lat * Math.PI / 180;
-                return Math.log(Math.tan(Math.PI / 4 + r / 2)) * 20037508.342789244 / Math.PI;
-            }
-
-            // ── Bbox centred exactly on violation point in Mercator space ──
-            // halfMercY is the vertical half-extent in Mercator metres.
-            // "Zoom ×3" from an auto-fit of ±40 per-sec points (~1500m span)
-            // means half-extent ÷ 2³ ≈ 190m. Use 200m for a small margin.
-            // halfMercX scaled to canvas aspect ratio so the image fills
-            // exactly without geographic distortion.
-            var HALF_Y = 200;                         // metres in Mercator
-            var HALF_X = HALF_Y * (IW / IH);          // ~410m — matches 860:420
-
-            var cMx = _mercX(violLon);                // Mercator centre X
-            var cMy = _mercY(violLat);                // Mercator centre Y
-
-            var mxMin = cMx - HALF_X, mxMax = cMx + HALF_X;
-            var myMin = cMy - HALF_Y, myMax = cMy + HALF_Y;
-
-            // ── lat/lon → pixel (Mercator, exact match to Esri render) ─────
-            function latLonToPixel(lat, lon) {
-                var mx = _mercX(lon), my = _mercY(lat);
-                var x = Math.round((mx - mxMin) / (mxMax - mxMin) * IW);
-                var y = Math.round((myMax - my) / (myMax - myMin) * IH);
-                return { x: x, y: y };
-            }
-
-            // ── Fetch Esri World Imagery via REST Export (EPSG:3857 bbox) ──
-            // Request both bboxSR and imageSR as 3857 — Esri renders native
-            // Mercator tiles → no internal reprojection → no resampling artefacts.
-            var bbox = mxMin + ',' + myMin + ',' + mxMax + ',' + myMax;
-            var esriUrl = 'https://server.arcgisonline.com/arcgis/rest/services/World_Imagery/MapServer/export' +
-                '?bbox=' + encodeURIComponent(bbox) +
-                '&bboxSR=3857' +
-                '&size=' + IW + '%2C' + IH +
-                '&imageSR=3857' +
-                '&format=png32' +
-                '&transparent=false' +
-                '&f=image';
-
-            var satImg = new Image();
-            satImg.crossOrigin = 'anonymous';
-
-            satImg.onload = function() {
-                var canvas = document.createElement('canvas');
-                canvas.width = IW; canvas.height = IH;
-                var ctx = canvas.getContext('2d');
-
-                // ── Draw satellite base ───────────────────────────────────
-                ctx.drawImage(satImg, 0, 0, IW, IH);
-
-                // ── Draw per-sec track polyline ───────────────────────────
-                if (trackPts.length > 1) {
-                    ctx.beginPath();
-                    ctx.strokeStyle = 'rgba(59,130,246,0.85)';
-                    ctx.lineWidth = 3;
-                    ctx.setLineDash([8, 5]);
-                    var first = true;
-                    trackPts.forEach(function(p) {
-                        if (!isValidGPS(p.lat, p.lon)) return;
-                        var px = latLonToPixel(p.lat, p.lon);
-                        if (first) { ctx.moveTo(px.x, px.y); first = false; }
-                        else ctx.lineTo(px.x, px.y);
-                    });
-                    ctx.stroke();
-                    ctx.setLineDash([]);
-                }
-
-                // ── Draw non-violation track dots (every point) ────────
-                trackPts.forEach(function(p, i) {
-                    if (i === localViolIdx || !isValidGPS(p.lat, p.lon)) return;
-                    var px = latLonToPixel(p.lat, p.lon);
-                    // Skip points outside visible canvas (clipping)
-                    if (px.x < -10 || px.x > IW+10 || px.y < -10 || px.y > IH+10) return;
-                    var proximity = 1 - Math.min(1, Math.abs(i - localViolIdx) / 82);
-                    ctx.beginPath();
-                    ctx.arc(px.x, px.y, 4.5, 0, Math.PI*2);
-                    ctx.fillStyle = 'rgba(59,130,246,' + (0.45 + 0.5*proximity) + ')';
-                    ctx.fill();
-                    ctx.strokeStyle = 'rgba(30,64,175,0.9)'; ctx.lineWidth = 1.2;
-                    ctx.stroke();
-                });
-
-                // ── Draw FSD signal markers ───────────────────────────────
-                fsdSignals.forEach(function(sig) {
-                    var px = latLonToPixel(sig.lat, sig.lon);
-                    var col = sig.dir === 'UP' ? '#8b5cf6' : (sig.dir === 'DN' ? '#f59e0b' : '#6b7280');
-                    // Square marker
-                    ctx.fillStyle = col;
-                    ctx.strokeStyle = 'white'; ctx.lineWidth = 1.5;
-                    ctx.beginPath();
-                    var s = 9;
-                    roundRect(ctx, px.x-s, px.y-s, s*2, s*2, 3);
-                    ctx.fill(); ctx.stroke();
-                    // Direction arrow
-                    ctx.fillStyle = 'white'; ctx.font = 'bold 10px Arial'; ctx.textAlign = 'center';
-                    ctx.fillText(sig.dir === 'UP' ? '▲' : (sig.dir === 'DN' ? '▼' : '●'), px.x, px.y+4);
-                    // Label
-                    ctx.fillStyle = col; ctx.font = 'bold 9px Arial'; ctx.textAlign = 'left';
-                    ctx.fillText('S' + (sig.sigNo||'?'), px.x+s+3, px.y+4);
-                });
-
-                // ── Draw violation pin (large red circle) ─────────────────
-                var vPx = latLonToPixel(violLat, violLon);
-                // Outer glow
-                ctx.beginPath();
-                ctx.arc(vPx.x, vPx.y, 22, 0, Math.PI*2);
-                ctx.fillStyle = 'rgba(239,68,68,0.25)'; ctx.fill();
-                // Main circle
-                ctx.beginPath();
-                ctx.arc(vPx.x, vPx.y, 16, 0, Math.PI*2);
-                ctx.fillStyle = '#ef4444'; ctx.fill();
-                ctx.strokeStyle = '#7f1d1d'; ctx.lineWidth = 3; ctx.stroke();
-                // Inner white dot
-                ctx.beginPath();
-                ctx.arc(vPx.x, vPx.y, 5, 0, Math.PI*2);
-                ctx.fillStyle = 'white'; ctx.fill();
-
-                // ── Speed label callout near violation pin ────────────────
-                var lx = vPx.x + 22, ly = vPx.y - 22;
-                // Keep label inside canvas
-                if (lx + 130 > IW) lx = vPx.x - 155;
-                if (ly < 30) ly = vPx.y + 30;
-                var sc = speedAtSignal > speedLimit ? '#dc2626' : '#16a34a';
-                var labelText = row.sigNo + ' — ' + speedAtSignal + ' km/h';
-                ctx.font = 'bold 12px Arial';
-                var tw = ctx.measureText(labelText).width + 16;
-                // Background pill
-                ctx.fillStyle = 'rgba(255,255,255,0.96)';
-                ctx.strokeStyle = sc; ctx.lineWidth = 2;
-                roundRect(ctx, lx, ly-16, tw, 22, 5);
-                ctx.fill(); ctx.stroke();
-                // Text
-                ctx.fillStyle = sc; ctx.textAlign = 'left';
-                ctx.fillText(labelText, lx+8, ly+1);
-
-                // Connector line from label to pin
-                ctx.beginPath();
-                ctx.moveTo(lx > vPx.x ? lx : lx+tw, ly+3);
-                ctx.lineTo(vPx.x, vPx.y-16);
-                ctx.strokeStyle = sc; ctx.lineWidth = 1.5; ctx.setLineDash([4,3]);
-                ctx.stroke(); ctx.setLineDash([]);
-
-                // ── Attribution strip ─────────────────────────────────────
-                ctx.fillStyle = 'rgba(0,0,0,0.55)';
-                ctx.fillRect(0, IH-18, IW, 18);
-                ctx.fillStyle = 'white'; ctx.font = '9px Arial'; ctx.textAlign = 'center';
-                ctx.fillText('Esri World Imagery · © Esri, DigitalGlobe, GeoEye, Earthstar Geographics', IW/2, IH-5);
-
-                // ── Violation info panel (mirrors showViolPanel) ───────────
-                // Build info lines
-                var isViol = (row.resultClass === 'violation' || row.resultClass === 'violation-multi');
-                var panelLines = [];
-                panelLines.push({ text: (isViol ? '🚨 VIOLATION' : '✅ ' + row.result), bold: true, color: isViol ? '#dc2626' : '#16a34a', size: 11 });
-                panelLines.push({ text: 'Train: ' + row.trainNo, bold: false, color: '#111', size: 10.5 });
-                panelLines.push({ text: 'Signal: ' + row.sigNo + ' @ ' + row.signalTime, bold: false, color: '#111', size: 10.5 });
-                var spdColor = speedAtSignal > speedLimit ? '#dc2626' : '#16a34a';
-                panelLines.push({ text: 'Speed @ SNT: ' + speedAtSignal + ' km/h', bold: true, color: spdColor, size: 10.5 });
-                panelLines.push({ text: 'RTIS Speed: ' + row.speed + ' km/h', bold: false, color: '#374151', size: 10 });
-
-                // Match quality line
-                var mqText = matchResult
-                    ? (matchResult.quality === 'exact'
-                        ? '✓ Exact match (Δ0.0s)'
-                        : '⚠ Closest (Δ' + (matchResult.diffMs/1000).toFixed(1) + 's)')
-                    : 'RTIS ping — no per-sec';
-                panelLines.push({ text: mqText, bold: false, color: matchResult && matchResult.quality === 'exact' ? '#16a34a' : '#b45309', size: 9.5 });
-
-                // FSD distance
-                if (row.cachedFsdSignals && row.cachedFsdSignals.length) {
-                    var trainDir2 = row.direction || row.dirTrain || '';
-                    var dirSigs2 = row.cachedFsdSignals.filter(function(s){ return s.dir === trainDir2; });
-                    if (!dirSigs2.length) dirSigs2 = row.cachedFsdSignals;
-                    var dFsd = null, nFsd = null;
-                    dirSigs2.forEach(function(s) {
-                        if (!isValidGPS(s.lat, s.lon)) return;
-                        var d = getDistance(violLat, violLon, s.lat, s.lon) * 1000;
-                        if (dFsd === null || d < dFsd) { dFsd = d; nFsd = s; }
-                    });
-                    if (dFsd !== null) {
-                        panelLines.push({ text: '📍 FSD: ' + dFsd.toFixed(0) + ' m' + (nFsd ? ' (' + nFsd.dir + ' S' + (nFsd.sigNo||'?') + ')' : ''), bold: false, color: '#6b7280', size: 10 });
-                    }
-                }
-
-                // ±5s speed trend — split into two lines so it doesn't overflow panel width
-                if (matchResult && matchResult.point && perSecondData[resultIdx]) {
-                    var _pts2 = perSecondData[resultIdx];
-                    var _sntT2 = matchResult.point.time.getTime();
-                    var _mi2 = 0, _md2 = Infinity;
-                    _pts2.forEach(function(p,i){ var d=Math.abs(p.time.getTime()-_sntT2); if(d<_md2){_md2=d;_mi2=i;} });
-                    var tPartsA = [], tPartsB = [];
-                    for (var _t = _mi2-5; _t <= _mi2+5; _t++) {
-                        var _val = (_t < 0 || _t >= _pts2.length) ? '—' : String(_pts2[_t].speed != null ? _pts2[_t].speed : '?');
-                        if (_t <= _mi2) tPartsA.push(_val); else tPartsB.push(_val);
-                    }
-                    panelLines.push({ text: '±5s: ' + tPartsA.join('→'), bold: false, color: '#374151', size: 9 });
-                    if (tPartsB.length) panelLines.push({ text: '     ' + tPartsB.join('→') + ' km/h', bold: false, color: '#374151', size: 9 });
-                }
-
-                // Calculate panel dimensions — wider to fit speed trend
-                var PX = 10, PY = 10;          // top-left position
-                var PAD2 = 9, LINE_H = 15;
-                var panelW = 210, panelH = PAD2 + panelLines.length * LINE_H + PAD2;
-
-                // Keep panel inside canvas
-                if (PX + panelW > IW - 10) PX = IW - panelW - 10;
-                if (PY + panelH > IH - 25) PY = IH - panelH - 25;
-
-                // Shadow
-                ctx.shadowColor = 'rgba(0,0,0,0.35)';
-                ctx.shadowBlur = 8; ctx.shadowOffsetX = 2; ctx.shadowOffsetY = 2;
-
-                // Panel background
-                ctx.fillStyle = 'rgba(255,255,255,0.97)';
-                roundRect(ctx, PX, PY, panelW, panelH, 8);
-                ctx.fill();
-                ctx.shadowColor = 'transparent'; ctx.shadowBlur = 0; ctx.shadowOffsetX = 0; ctx.shadowOffsetY = 0;
-
-                // Left accent bar
-                ctx.fillStyle = isViol ? '#ef4444' : '#22c55e';
-                roundRect(ctx, PX, PY, 4, panelH, 4);
-                ctx.fill();
-
-                // Border
-                ctx.strokeStyle = isViol ? 'rgba(239,68,68,0.35)' : 'rgba(34,197,94,0.35)';
-                ctx.lineWidth = 1;
-                roundRect(ctx, PX, PY, panelW, panelH, 8);
-                ctx.stroke();
-
-                // Draw each line
-                var ly2 = PY + PAD2 + 11;
-                ctx.textAlign = 'left';
-                panelLines.forEach(function(line) {
-                    ctx.font = (line.bold ? 'bold ' : '') + line.size + 'px Arial';
-                    ctx.fillStyle = line.color;
-                    ctx.fillText(line.text, PX + 10, ly2);
-                    ly2 += LINE_H;
-                });
-
-                resolve(canvas.toDataURL('image/png'));
-            };
-
-            satImg.onerror = function() {
-                // Esri fetch failed — try OSM Nominatim tiles as fallback
-                _fetchOsmFallback(row, violLat, violLon, speedAtSignal, speedLimit,
-                    trackPts, localViolIdx, fsdSignals, latLonToPixel, IW, IH, resolve);
-            };
-
-            satImg.src = esriUrl;
-        });
-    }
-
-    // Helper: rounded rectangle path
-    function roundRect(ctx, x, y, w, h, r) {
-        ctx.beginPath();
-        ctx.moveTo(x+r, y);
-        ctx.lineTo(x+w-r, y); ctx.arcTo(x+w, y, x+w, y+r, r);
-        ctx.lineTo(x+w, y+h-r); ctx.arcTo(x+w, y+h, x+w-r, y+h, r);
-        ctx.lineTo(x+r, y+h); ctx.arcTo(x, y+h, x, y+h-r, r);
-        ctx.lineTo(x, y+r); ctx.arcTo(x, y, x+r, y, r);
-        ctx.closePath();
-    }
-
-    // OSM static tiles fallback (when Esri REST fails)
-    function _fetchOsmFallback(row, violLat, violLon, speedAtSignal, speedLimit,
-                                trackPts, localViolIdx, fsdSignals, latLonToPixel, IW, IH, resolve) {
-        // Build a plain dark canvas with info — OSM tiles have CORS restrictions so we just show a clean placeholder
-        var canvas = document.createElement('canvas');
-        canvas.width = IW; canvas.height = IH;
-        var ctx = canvas.getContext('2d');
-
-        // Dark background
-        ctx.fillStyle = '#1e293b';
-        ctx.fillRect(0, 0, IW, IH);
-
-        // Grid
-        ctx.strokeStyle = '#334155'; ctx.lineWidth = 0.8;
-        for (var gx = 0; gx < IW; gx += 80) { ctx.beginPath(); ctx.moveTo(gx,0); ctx.lineTo(gx,IH); ctx.stroke(); }
-        for (var gy = 0; gy < IH; gy += 80) { ctx.beginPath(); ctx.moveTo(0,gy); ctx.lineTo(IW,gy); ctx.stroke(); }
-
-        // Track polyline
-        if (trackPts.length > 1) {
-            ctx.beginPath(); ctx.strokeStyle = 'rgba(96,165,250,0.8)'; ctx.lineWidth = 2.5; ctx.setLineDash([7,4]);
-            var first = true;
-            trackPts.forEach(function(p) {
-                if (!isValidGPS(p.lat, p.lon)) return;
-                var px = latLonToPixel(p.lat, p.lon);
-                first ? (ctx.moveTo(px.x,px.y), first=false) : ctx.lineTo(px.x,px.y);
-            });
-            ctx.stroke(); ctx.setLineDash([]);
-        }
-
-        // Violation pin
-        var vPx = latLonToPixel(violLat, violLon);
-        ctx.beginPath(); ctx.arc(vPx.x, vPx.y, 18, 0, Math.PI*2);
-        ctx.fillStyle = '#ef4444'; ctx.fill();
-        ctx.strokeStyle = '#fca5a5'; ctx.lineWidth = 3; ctx.stroke();
-        ctx.beginPath(); ctx.arc(vPx.x, vPx.y, 6, 0, Math.PI*2);
-        ctx.fillStyle = 'white'; ctx.fill();
-
-        // Labels
-        ctx.fillStyle = 'white'; ctx.font = 'bold 14px Arial'; ctx.textAlign = 'center';
-        ctx.fillText('Train ' + row.trainNo + '  |  ' + row.station + '  |  ' + row.sigNo, IW/2, 30);
-        ctx.font = '11px Arial'; ctx.fillStyle = speedAtSignal > speedLimit ? '#fca5a5' : '#86efac';
-        ctx.fillText(speedAtSignal + ' km/h  (Limit ' + speedLimit + ' km/h)  @ ' + row.signalTime, IW/2, 50);
-        ctx.fillStyle = '#94a3b8'; ctx.font = '10px Arial';
-        ctx.fillText('GPS: ' + violLat.toFixed(5) + ', ' + violLon.toFixed(5), IW/2, IH - 22);
-        ctx.fillStyle = '#475569';
-        ctx.fillText('(Satellite imagery unavailable)', IW/2, IH - 8);
-
-        resolve(canvas.toDataURL('image/png'));
-    }
-
-
-    // Canvas fallback when leaflet-image fails
-    function _mapFallbackCanvas(row, lat, lon, speed, speedLimit) {
-        var c = document.createElement('canvas');
-        c.width = 860; c.height = 420;
-        var ctx = c.getContext('2d');
-        ctx.fillStyle = '#1e293b';
-        ctx.fillRect(0, 0, c.width, c.height);
-        // Grid lines
-        ctx.strokeStyle = '#334155'; ctx.lineWidth = 1;
-        for (var i = 0; i < c.width; i += 60) { ctx.beginPath(); ctx.moveTo(i,0); ctx.lineTo(i,c.height); ctx.stroke(); }
-        for (var j = 0; j < c.height; j += 60) { ctx.beginPath(); ctx.moveTo(0,j); ctx.lineTo(c.width,j); ctx.stroke(); }
-        // Center dot
-        ctx.fillStyle = '#ef4444';
-        ctx.beginPath(); ctx.arc(c.width/2, c.height/2, 18, 0, Math.PI*2); ctx.fill();
-        ctx.fillStyle = '#fef2f2'; ctx.beginPath(); ctx.arc(c.width/2, c.height/2, 6, 0, Math.PI*2); ctx.fill();
-        // Labels
-        ctx.fillStyle = 'white'; ctx.font = 'bold 16px Arial'; ctx.textAlign = 'center';
-        ctx.fillText('Train ' + row.trainNo + '  |  ' + row.station + '  |  Signal ' + row.sigNo, c.width/2, c.height/2 - 35);
-        ctx.font = '13px Arial';
-        ctx.fillStyle = speed > speedLimit ? '#fca5a5' : '#86efac';
-        ctx.fillText('Speed: ' + speed + ' km/h  (Limit: ' + speedLimit + ' km/h)  @ ' + row.signalTime, c.width/2, c.height/2 + 35);
-        ctx.fillStyle = '#94a3b8'; ctx.font = '11px Arial';
-        ctx.fillText('GPS: ' + (lat||'?') + ', ' + (lon||'?'), c.width/2, c.height/2 + 55);
-        ctx.fillStyle = '#475569'; ctx.font = '10px Arial';
-        ctx.fillText('(Satellite imagery unavailable — map tiles could not be loaded)', c.width/2, c.height - 15);
-        return c.toDataURL('image/png');
-    }
-
-    // Render a speed-time chart into #reportChartCanvas and return PNG dataURL
-    function _captureChartForRow(row, resultIdx) {
-        // Compute braking distance for PDF label and attach to row
-        var _pts2 = perSecondData[resultIdx] || [];
-        if (_pts2.length && row.sntTimeISO) {
-            var _sntMs2 = new Date(row.sntTimeISO).getTime();
-            var _vi2 = 0, _bd2 = Infinity;
-            _pts2.forEach(function(p, i) { var d = Math.abs(p.time.getTime() - _sntMs2); if (d < _bd2) { _bd2 = d; _vi2 = i; } });
-            row._pdfBrakingDist = _calcBrakingDist(_pts2, _sntMs2, _vi2);
-        } else {
-            row._pdfBrakingDist = null;
-        }
-        return new Promise(function(resolve) {
-            var canvas = document.getElementById('reportChartCanvas');
-            canvas.width = 900; canvas.height = 400;
-            var ctx = canvas.getContext('2d');
-            ctx.clearRect(0, 0, 900, 400);
-
-            var speedLimit = parseFloat(document.getElementById('inputSpeedLimit').value) || 63;
-            var hasPersec  = perSecondData[resultIdx] && perSecondData[resultIdx].length > 0;
-            var sntDateObj = row.sntTimeISO ? new Date(row.sntTimeISO) : (function() {
-                var base = row.violationTime instanceof Date ? row.violationTime : new Date(row.violationTimeStr);
-                var d = new Date(base); var tp = (row.signalTime || '').match(/(\d{1,2}):(\d{2})(?::(\d{2}))?/);
-                if (tp) d.setHours(parseInt(tp[1]), parseInt(tp[2]), parseInt(tp[3]||0), 0); return d;
-            })();
-
-            var displayPts = [], violIdx = -1;
-            if (hasPersec) {
-                var allPts = perSecondData[resultIdx];
-                var grMatch = row.perSecMatch || matchPerSecToSNT(allPts, sntDateObj);
-                var matchIdx = grMatch ? (grMatch.idx || 0) : 0;
-                // Try ±3 min time window first
-                var violMs = sntDateObj.getTime(), w3 = 3 * 60 * 1000;
-                var timePts = allPts.filter(function(p) { return Math.abs(p.time.getTime() - violMs) <= w3; });
-                // If too few, use ±120 index window around matched point (covers 2 min of per-sec data)
-                if (timePts.length < 5) {
-                    displayPts = allPts.slice(Math.max(0, matchIdx - 120), Math.min(allPts.length, matchIdx + 121));
-                } else {
-                    displayPts = timePts;
-                }
-                // If still too few, show all data
-                if (displayPts.length < 3) displayPts = allPts;
-                violIdx = grMatch ? displayPts.findIndex(function(p) { return p === grMatch.point; }) : -1;
-                if (violIdx < 0 && grMatch && grMatch.point) {
-                    var bestD = Infinity;
-                    displayPts.forEach(function(p, i) { var d = Math.abs(p.time - grMatch.point.time); if (d < bestD) { bestD = d; violIdx = i; } });
-                }
-            } else {
-                var trainKey = String(row.trainNo), stnKey = row.stationKey || cleanStationName(row.station.split('→')[0].trim());
-                dataRTIS.forEach(function(r) {
-                    var t = getCol(r, ['Train Number','Train No.','TRAIN','Train']), stn = cleanStationName(getCol(r, ['Station','STATION','STN_CODE']));
-                    if (String(t) !== trainKey || stn !== stnKey) return;
-                    var tm = parseSmartDate(getCol(r, ['Event Time','TIME','EventTime','Date']));
-                    var spd = parseFloat(getCol(r, ['Speed','SPEED']));
-                    if (tm && !isNaN(spd)) displayPts.push({ time: tm, speed: spd });
-                });
-                displayPts.sort(function(a, b) { return a.time - b.time; });
-                if (!displayPts.length) { var base = row.violationTime instanceof Date ? row.violationTime : new Date(row.violationTimeStr); displayPts.push({ time: base, speed: parseFloat(row.speed) }); }
-                var violMs2 = sntDateObj.getTime();
-                var bestD2 = Infinity;
-                displayPts.forEach(function(p, i) { var d = Math.abs(p.time.getTime() - violMs2); if (d < bestD2) { bestD2 = d; violIdx = i; } });
-            }
-
-            var labels = displayPts.map(function(p) { return p.time.toTimeString().slice(0, 8); });
-            var speeds = displayPts.map(function(p) { return (p.speed != null && !isNaN(p.speed)) ? p.speed : null; });
-            var ll = speeds.map(function() { return speedLimit; });
-            var ptColors = speeds.map(function(s, i) { return i === violIdx ? '#ef4444' : (s != null && s > speedLimit ? '#f97316' : '#3b82f6'); });
-            var ptRadii = speeds.map(function(s, i) { return i === violIdx ? 8 : 3; });
-
-            var tempChart = new Chart(ctx, {
-                type: 'line',
-                data: {
-                    labels: labels,
-                    datasets: [
-                        { label: 'Speed (km/h)', data: speeds, borderColor: '#3b82f6', backgroundColor: 'rgba(59,130,246,0.08)',
-                          borderWidth: 2, pointBackgroundColor: ptColors, pointRadius: ptRadii, tension: 0.3, fill: true, spanGaps: true },
-                        { label: 'Limit (' + speedLimit + ' km/h)', data: ll, borderColor: '#ef4444',
-                          borderWidth: 2, borderDash: [8, 4], pointRadius: 0, fill: false }
-                    ]
-                },
-                options: {
-                    responsive: false, animation: { duration: 0 },
-                    plugins: {
-                        legend: { position: 'top', labels: { font: { size: 12 } } },
-                        title: {
-                            display: true,
-                            text: 'Train ' + row.trainNo + '  ·  ' + row.station + '  ·  Signal ' + row.sigNo + '  ·  ' + row.signalTime,
-                            font: { size: 13, weight: 'bold' }, color: '#1e293b', padding: { bottom: 8 }
-                        }
-                    },
-                    scales: {
-                        x: { ticks: { maxTicksLimit: 14, font: { size: 10 } }, grid: { color: '#f1f5f9' } },
-                        y: { title: { display: true, text: 'Speed (km/h)', font: { size: 11 } }, min: 0,
-                             suggestedMax: Math.max(speedLimit + 20, (Math.max.apply(null, speeds.filter(Boolean)) || 0) + 10),
-                             grid: { color: '#f1f5f9' } }
-                    }
-                },
-                plugins: [{
-                    id: 'vLine',
-                    afterDraw: function(chart) {
-                        if (violIdx < 0 || violIdx >= chart.data.labels.length) return;
-                        var meta = chart.getDatasetMeta(0);
-                        if (!meta.data[violIdx]) return;
-                        var x = meta.data[violIdx].x, c = chart.ctx;
-                        c.save(); c.beginPath(); c.moveTo(x, chart.chartArea.top); c.lineTo(x, chart.chartArea.bottom);
-                        c.strokeStyle = 'rgba(239,68,68,0.7)'; c.lineWidth = 2; c.setLineDash([5, 3]); c.stroke();
-                        var spd = speeds[violIdx];
-                        c.fillStyle = '#dc2626'; c.font = 'bold 11px Arial'; c.setLineDash([]);
-                        c.fillText('🚨 ' + row.sigNo + '  ' + (spd != null ? spd + ' km/h' : ''), x + 5, chart.chartArea.top + 16);
-                        c.restore();
-                    }
-                }, {
-                    id: 'pdfBrakingDist',
-                    afterDraw: function(chart) {
-                        // Compute braking distance inline for the PDF chart
-                        var pdfBd = (function() {
-                            if (!hasPersec || !displayPts.length || violIdx < 0) return null;
-                            var sntMs2 = sntDateObj.getTime();
-                            var winS = displayPts[0].time.getTime();
-                            var winE = displayPts[displayPts.length-1].time.getTime();
-                            if (sntMs2 < winS || sntMs2 > winE) return null;
-                            var tot = 0, stopI = displayPts.length - 1, stopped = false;
-                            for (var bi = violIdx; bi < displayPts.length; bi++) {
-                                var bp = displayPts[bi];
-                                if (bp.distFromSpeed != null && !isNaN(bp.distFromSpeed)) tot += bp.distFromSpeed;
-                                if (!isNaN(bp.speed) && bp.speed < 1) { stopI = bi; stopped = true; break; }
-                            }
-                            return { distM: Math.round(tot), vi: violIdx, si: stopI, stopped: stopped };
-                        })();
-                        if (!pdfBd) return;
-                        var meta2 = chart.getDatasetMeta(0);
-                        if (!meta2.data[pdfBd.vi] || !meta2.data[pdfBd.si]) return;
-                        var x1 = meta2.data[pdfBd.vi].x, x2 = meta2.data[pdfBd.si].x;
-                        if (x2 < x1 + 2) x2 = x1 + 2;
-                        var top2 = chart.chartArea.top, bot2 = chart.chartArea.bottom;
-                        var c2 = chart.ctx;
-                        c2.save();
-                        // Shaded region
-                        c2.fillStyle = 'rgba(251,146,60,0.13)';
-                        c2.fillRect(x1, top2, x2 - x1, bot2 - top2);
-                        // Right boundary
-                        c2.strokeStyle = 'rgba(234,88,12,0.65)'; c2.lineWidth = 1.5; c2.setLineDash([4,3]);
-                        c2.beginPath(); c2.moveTo(x2, top2); c2.lineTo(x2, bot2); c2.stroke();
-                        c2.setLineDash([]);
-                        // Distance pill label
-                        var bdLabel = (pdfBd.stopped ? '🛑 Stop' : '→ End') + ': ' + pdfBd.distM + ' m';
-                        c2.font = 'bold 11px Arial';
-                        var tw2 = c2.measureText(bdLabel).width + 16;
-                        var midX = (x1 + x2) / 2, lx2 = Math.max(x1 + 2, midX - tw2/2);
-                        if (lx2 + tw2 > chart.chartArea.right - 4) lx2 = chart.chartArea.right - tw2 - 6;
-                        var ly3 = top2 + 80;
-                        c2.fillStyle = 'rgba(255,255,255,0.96)';
-                        c2.strokeStyle = 'rgba(234,88,12,0.8)'; c2.lineWidth = 1.5;
-                        c2.beginPath();
-                        c2.moveTo(lx2+5,ly3-14); c2.lineTo(lx2+tw2-5,ly3-14);
-                        c2.arcTo(lx2+tw2,ly3-14,lx2+tw2,ly3-9,5); c2.lineTo(lx2+tw2,ly3+4);
-                        c2.arcTo(lx2+tw2,ly3+9,lx2+tw2-5,ly3+9,5); c2.lineTo(lx2+5,ly3+9);
-                        c2.arcTo(lx2,ly3+9,lx2,ly3+4,5); c2.lineTo(lx2,ly3-9);
-                        c2.arcTo(lx2,ly3-14,lx2+5,ly3-14,5); c2.closePath();
-                        c2.fill(); c2.stroke();
-                        c2.fillStyle = '#c2410c'; c2.textAlign = 'left';
-                        c2.fillText(bdLabel, lx2 + 8, ly3 + 2);
-                        c2.restore();
-                    }
-                }]
-            });
-
-            setTimeout(function() {
-                var dataUrl = canvas.toDataURL('image/png');
-                tempChart.destroy();
-                resolve(dataUrl);
-            }, 200);
-        });
-    }
-
-    // Fetch a dataURL image and return ArrayBuffer of PNG bytes
-    function _dataUrlToBytes(dataUrl) {
-        var b64 = dataUrl.split(',')[1];
-        var bin = atob(b64);
-        var arr = new Uint8Array(bin.length);
-        for (var i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
-        return arr.buffer;
-    }
-
-    // ══════════════════════════════════════════════════════════════
-    // PDF REPORT SYSTEM (Extracted to src/ui/pdf-generator.js)
-    // ══════════════════════════════════════════════════════════════
+    import { captureMapForRow, captureChartForRow, reportProgress } from './ui/pdf-capture.js';
     import { openPdfDialog as _openPdfDialog, closePdfDialog as _closePdfDialog, pdfExpandAll as _pdfExpandAll, generateAllPdfs as _generateAllPdfs } from './ui/pdf-generator.js';
+
+    // ══════════════════════════════════════════════════════════════
+    // GOOGLE DRIVE UPLOAD (src/ui/google-drive.js)
+    // ══════════════════════════════════════════════════════════════
+    import { initGoogleDrive, isDriveConfigured, isAuthenticated, authenticate,
+             showUploadDialog, closeUploadDialog,
+             updateFileStatus as _driveUpdateFileStatus,
+             markUploadComplete,
+             uploadToDrive } from './ui/google-drive.js';
+
+    function _buildPdfCtx() {
+        return {
+            perSecondData: perSecondData,
+            dataRTIS: dataRTIS,
+            dataFSD: dataFSD,
+            getSpeedLimit: function() { return parseFloat(document.getElementById('inputSpeedLimit').value) || 63; }
+        };
+    }
+    
+    function _captureMapWrapper(row, resultIdx) {
+        return captureMapForRow(row, resultIdx, _buildPdfCtx());
+    }
+    
+    function _captureChartWrapper(row, resultIdx) {
+        return captureChartForRow(row, resultIdx, _buildPdfCtx());
+    }
 
     function openPdfDialog()     { _openPdfDialog(analysisResults); }
     function closePdfDialog()    { _closePdfDialog(); }
     function pdfExpandAll(open)  { _pdfExpandAll(open); }
-    function generateAllPdfs()   { _generateAllPdfs(analysisResults, _captureMapForRow, _captureChartForRow, _reportProgress); }
+    function generateAllPdfs()   {
+        _generateAllPdfs(analysisResults, _captureMapWrapper, _captureChartWrapper, reportProgress, function(generatedPdfs) {
+            // After PDFs are generated and auto-downloaded, show Drive upload dialog
+            if (generatedPdfs && generatedPdfs.length > 0) {
+                _showDriveUploadDialog(generatedPdfs);
+            }
+        });
+    }
+
+    // ── Google Drive upload flow ──────────────────────────────────
+    var _pendingDrivePdfs = [];
+
+    // Initialize Google Drive on DOMContentLoaded
+    document.addEventListener('DOMContentLoaded', function() {
+        // Try to init with stored Client ID, or skip if not configured
+        var storedClientId = localStorage.getItem('googleDriveClientId') || '';
+        if (storedClientId) {
+            setTimeout(function() { initGoogleDrive(storedClientId); }, 1500);
+        }
+    });
+
+    function _showDriveUploadDialog(generatedPdfs) {
+        _pendingDrivePdfs = generatedPdfs;
+        showUploadDialog(generatedPdfs, function(selected) {
+            _doDriveUpload(selected);
+        });
+    }
+
+    async function _doDriveUpload(selected) {
+        // Check if Drive is configured
+        if (!isDriveConfigured()) {
+            // Prompt for Client ID
+            var clientId = prompt(
+                'Google Drive API Client ID required.\n\n' +
+                'To set up Google Drive upload:\n' +
+                '1. Go to console.cloud.google.com\n' +
+                '2. Create a project and enable Google Drive API\n' +
+                '3. Create OAuth2 Client ID (Web application)\n' +
+                '4. Add your app URL to Authorized JavaScript origins\n\n' +
+                'Enter your OAuth2 Client ID:'
+            );
+            if (!clientId) {
+                markUploadComplete(0, 0);
+                return;
+            }
+            localStorage.setItem('googleDriveClientId', clientId.trim());
+            if (!initGoogleDrive(clientId.trim())) {
+                alert('Failed to initialize Google Drive. The Google Identity Services library may not have loaded yet. Please try again.');
+                markUploadComplete(0, 0);
+                return;
+            }
+        }
+
+        // Authenticate if needed
+        if (!isAuthenticated()) {
+            var authSuccess = await new Promise(function(resolve) {
+                authenticate(resolve);
+            });
+            if (!authSuccess) {
+                alert('Google Drive authentication failed or was cancelled.');
+                markUploadComplete(0, 0);
+                return;
+            }
+        }
+
+        // Upload files one by one
+        var successCount = 0, failCount = 0;
+        var statusEl = document.getElementById('driveUploadStatus');
+        for (var i = 0; i < selected.length; i++) {
+            var item = selected[i];
+            _driveUpdateFileStatus(item.index, 'uploading');
+            if (statusEl) statusEl.textContent = 'Uploading ' + (i + 1) + '/' + selected.length + '...';
+            try {
+                await uploadToDrive(item.blob, item.filename);
+                _driveUpdateFileStatus(item.index, 'done');
+                successCount++;
+                log('📤 Uploaded to Drive: ' + item.filename);
+            } catch(e) {
+                _driveUpdateFileStatus(item.index, 'error', e.message);
+                failCount++;
+                log('❌ Drive upload failed: ' + item.filename + ' — ' + e.message);
+            }
+        }
+
+        if (statusEl) statusEl.textContent = successCount + ' uploaded' + (failCount ? ', ' + failCount + ' failed' : '');
+        markUploadComplete(successCount, failCount);
+        log('📤 Google Drive upload complete: ' + successCount + ' uploaded, ' + failCount + ' failed');
+    }
+
+    function closeDriveUploadDialog() { closeUploadDialog(); }
+    function startDriveUpload() {
+        // Triggered by the Upload button in the dialog
+        var selected = [];
+        _pendingDrivePdfs.forEach(function(f, i) {
+            var cb = document.getElementById('driveFile_' + i);
+            if (cb && cb.checked) {
+                selected.push({ blob: f.blob, filename: f.filename, index: i });
+            }
+        });
+        if (selected.length === 0) return;
+
+        // Disable controls
+        var uploadBtn = document.getElementById('driveUploadBtn');
+        if (uploadBtn) { uploadBtn.disabled = true; uploadBtn.textContent = '⏳ Uploading...'; }
+        var checkboxes = document.getElementById('driveFileList').querySelectorAll('input[type=checkbox]');
+        checkboxes.forEach(function(cb) { cb.disabled = true; });
+
+        _doDriveUpload(selected);
+    }
 
     // ══════════════════════════════════════════════════════════════
 // SPEED-TIME GRAPH (Extracted to src/ui/speed-graph.js)
@@ -1552,7 +1079,7 @@ import { processSpeedGraph as _openGraph, closeSpeedGraph as _closeGraph } from 
 
 function openGraph(resultIdx) {
     var speedLimit = parseFloat(document.getElementById('inputSpeedLimit').value) || 63;
-    speedChartInstance = _openGraph(resultIdx, analysisResults, perSecondData, dataRTIS, speedLimit, speedChartInstance, _initFilterUI, _msToTimeStr, _buildStnOptions, _drawChart, matchPerSecToSNT);
+    speedChartInstance = _openGraph(resultIdx, analysisResults, perSecondData, dataRTIS, speedLimit, speedChartInstance, _initFilterUI, filterChart.msToTimeStr, filterChart.buildStnOptions, _drawChart, matchPerSecToSNT);
 }
 
 function closeGraph() {
@@ -1564,7 +1091,15 @@ function closeGraph() {
 // ══════════════════════════════════════════════════════════════
 import { openMapEditor as _openMapEditor, closeMapEditor as _closeMapEditor, getMappingEdits, exportMappingCSV as _exportMappingCSV } from './ui/mapping-editor.js';
 
-function openMapEditor() { _openMapEditor(dataRTIS, allFsdStationNames, stationMappingCache, manualOverrides); }
+function openMapEditor() {
+    var fsdNames = new Set();
+    dataFSD.forEach(function(r) {
+        var s = cleanStationName(getCol(r, ['Station','STATION','STN_CODE','Station Name']));
+        if (s) fsdNames.add(s);
+    });
+    var fsdList = Array.from(fsdNames).sort();
+    _openMapEditor(dataRTIS, fsdList, stationMappingCache, manualOverrides);
+}
 function closeMapEditor() { _closeMapEditor(); }
 function applyMappingEdits() {
     getMappingEdits(manualOverrides, stationMappingCache);
@@ -1602,350 +1137,36 @@ function exportMappingCSV() { _exportMappingCSV(dataRTIS, stationMappingCache, m
         document.addEventListener('mouseup', function(){ dragging=false; });
     })();
 
+    // ══════════════════════════════════════════════════════════════
+    // FILTER-CHART (Extracted to src/ui/filter-chart.js)
+    // ══════════════════════════════════════════════════════════════
+    import * as filterChart from './ui/filter-chart.js';
+
     function showViolPanel(row, speedAtSignal, speedLimit, matchQuality, diffSecStr, distToFsdM, nearestFsdSig, distToRtisM) {
-        var p = document.getElementById('violPanel');
-        var isV = (row.resultClass === 'violation' || row.resultClass === 'violation-multi');
-        p.className = isV ? '' : 'complied-panel';
-        document.getElementById('vpTitle').innerHTML =
-            (isV ? '🚨 ' : '✅ ') + row.result +
-            ' <span class="vp-drag-hint">✥ drag</span>';
-        var sc  = speedAtSignal > speedLimit ? '#dc2626' : '#16a34a';
-        var mLine = matchQuality==='exact'
-            ? '<span style="color:#16a34a;font-size:0.72rem">✓ Exact match (Δ'+diffSecStr+')</span>'
-            : matchQuality==='closest'
-            ? '<span style="color:#b45309;font-size:0.72rem">⚠ Closest (Δ'+diffSecStr+')</span>'
-            : '<span style="color:#9ca3af;font-size:0.72rem">RTIS ping — no per-sec</span>';
-        var fLine = distToFsdM!=null ? '<br>📍 FSD: <b>'+distToFsdM.toFixed(0)+' m</b>'+(nearestFsdSig?' ('+nearestFsdSig.dir+' S'+(nearestFsdSig.sigNo||'?')+')':'') : '';
-        var rLine = (distToRtisM!=null && distToRtisM>1) ? '<br>🚂 RTIS H: <b>'+distToRtisM.toFixed(0)+' m</b>' : '';
-        // Build ±5s speed trend from per-sec data if available
-        var trendHtml = '';
-        if (row.perSecMatch && row.perSecMatch.point) {
-            // find resultIdx from analysisResults
-            var _ridx = analysisResults.indexOf(row);
-            var _pts = _ridx >= 0 && perSecondData[_ridx] ? perSecondData[_ridx] : null;
-            if (_pts && _pts.length) {
-                // find matched point index
-                var _sntT = row.perSecMatch.point.time.getTime();
-                var _mi = 0, _md = Infinity;
-                _pts.forEach(function(p,i){ var d=Math.abs(p.time.getTime()-_sntT); if(d<_md){_md=d;_mi=i;} });
-                var _trend = [], _limit = parseFloat(document.getElementById('inputSpeedLimit').value)||63;
-                for (var _t = _mi-5; _t <= _mi+5; _t++) {
-                    if (_t < 0 || _t >= _pts.length) { _trend.push('<span style="color:#d1d5db">—</span>'); continue; }
-                    var _sp = _pts[_t].speed;
-                    var _col = isNaN(_sp) ? '#9ca3af' : (_sp > _limit ? '#dc2626' : '#16a34a');
-                    var _bold = _t === _mi ? 'font-weight:900;text-decoration:underline;font-size:1rem;' : '';
-                    _trend.push('<span style="color:'+_col+';'+_bold+'">'+(_sp||'?')+'</span>');
-                }
-                trendHtml = '<br><span style="font-size:0.72rem;color:#6b7280;">±5s trend:</span><br>' +
-                    '<span style="font-size:0.8rem;letter-spacing:0.5px;">' + _trend.join(' → ') + '</span>' +
-                    '<span style="font-size:0.7rem;color:#9ca3af;"> km/h</span>';
-            }
-        }
-        document.getElementById('vpBody').innerHTML =
-            'Train: <b>'+row.trainNo+'</b><br>' +
-            'Signal: <b>'+row.sigNo+'</b> @ '+row.signalTime+'<br>' +
-            'Speed @ SNT: <b style="color:'+sc+'">'+speedAtSignal+' km/h</b><br>' +
-            'RTIS Speed: '+row.speed+' km/h<br>' +
-            mLine + fLine + rLine + trendHtml;
-        p.style.display = 'block';
-        // default position — top right, reset each open
-        p.style.right = '14px'; p.style.top = '60px'; p.style.left = 'auto';
+        filterChart.setupFilterChartContext(getLeafletMap(), speedChartInstance, function(){ return parseFloat(document.getElementById('inputSpeedLimit').value)||63; }, analysisResults, perSecondData);
+        filterChart.showViolPanel(row, speedAtSignal, speedLimit, matchQuality, diffSecStr, distToFsdM, nearestFsdSig, distToRtisM);
     }
-
-    // ════════════════════════════════════════════════════════════════
-    // MOD 3+4: SHARED FILTER STATE
-    // ════════════════════════════════════════════════════════════════
-    var _fc = null;  // { allPts, sntMs, row, resultIdx }
-    var _brakingDistResult = null; // { distM, violIdx, stopIdx, stoppedAtZero }
-
-    // ── Braking distance: from violation point → first speed=0 or window end ──
-    // Returns null if violation point is outside the pts window.
-    // distFromSpeed is a per-second metre increment stored on each point.
-    function _calcBrakingDist(pts, sntMs, violIdx) {
-        if (!pts || !pts.length || violIdx < 0) return null;
-        var winStart = pts[0].time.getTime();
-        var winEnd   = pts[pts.length - 1].time.getTime();
-        // Violation point must be inside the current window
-        if (sntMs < winStart || sntMs > winEnd) return null;
-
-        var totalDist = 0;
-        var stopIdx = pts.length - 1; // default: end of window
-        var stoppedAtZero = false;
-
-        for (var i = violIdx; i < pts.length; i++) {
-            var p = pts[i];
-            // Accumulate per-second distance increment
-            if (p.distFromSpeed !== null && p.distFromSpeed !== undefined && !isNaN(p.distFromSpeed)) {
-                totalDist += p.distFromSpeed;
-            }
-            // Stop at first point where speed drops below 1 km/h
-            // (some RTIS devices never report exact 0 — values like 0.23, 0.89 are effectively stopped)
-            if (!isNaN(p.speed) && p.speed < 1) {
-                stopIdx = i;
-                stoppedAtZero = true;
-                break;
-            }
-        }
-        return { distM: Math.round(totalDist), violIdx: violIdx, stopIdx: stopIdx, stoppedAtZero: stoppedAtZero };
+    
+    // UI setup wrappers for speed-graph
+    function _initFilterUI(pts, sntMs, resultIdx, row) { filterChart.initFilterUI(pts, sntMs, resultIdx, row); }
+    function _drawChart(pts, sntMs, row) { 
+        filterChart.setupFilterChartContext(getLeafletMap(), speedChartInstance, function(){ return parseFloat(document.getElementById('inputSpeedLimit').value)||63; }, analysisResults, perSecondData);
+        filterChart.drawChart(pts, sntMs, row); 
+        speedChartInstance = filterChart.getSpeedChartInstance();
     }
-
-    function _msToTimeStr(ms){ return new Date(ms).toTimeString().slice(0,8); }
-    function _timeToMs(tStr, refDate){
-        var p=tStr.split(':').map(Number), d=new Date(refDate);
-        d.setHours(p[0]||0, p[1]||0, p[2]||0, 0); return d.getTime();
-    }
-
-    function _buildStnOptions(sel, pts, nearMs) {
-        var seen=[], opts=[];
-        pts.forEach(function(p){
-            if(p.stn && p.stn!=='—' && seen.indexOf(p.stn)<0){ seen.push(p.stn); opts.push({s:p.stn,ms:p.time.getTime()}); }
-        });
-        sel.innerHTML='';
-        opts.forEach(function(o){
-            var el=document.createElement('option');
-            el.value=o.ms; el.textContent=o.s;
-            if(nearMs!=null && Math.abs(o.ms-nearMs)<60000) el.selected=true;
-            sel.appendChild(el);
-        });
-    }
-
-    function _initFilterUI(pts, sntMs, resultIdx, row) {
-        _fc = { allPts:pts, sntMs:sntMs, resultIdx:resultIdx, row:row };
-        var f=pts[0].time.getTime(), t=pts[pts.length-1].time.getTime();
-        // Map strip
-        var ms=document.getElementById('mapFilterStrip');
-        ms.style.display='flex';
-        document.getElementById('mfFromTime').value=_msToTimeStr(f);
-        document.getElementById('mfToTime').value=_msToTimeStr(t);
-        _buildStnOptions(document.getElementById('mfFromStn'),pts,f);
-        _buildStnOptions(document.getElementById('mfToStn'),pts,t);
-        document.getElementById('mfPointCount').textContent='';
-        // Graph strip
-        var gs=document.getElementById('gfStrip');
-        gs.style.display='flex';
-        document.getElementById('gfFromTime').value=_msToTimeStr(f);
-        document.getElementById('gfToTime').value=_msToTimeStr(t);
-        _buildStnOptions(document.getElementById('gfFromStn'),pts,f);
-        _buildStnOptions(document.getElementById('gfToStn'),pts,t);
-        document.getElementById('gfPointCount').textContent='';
-    }
-
-    function _getFiltered(pref) {
-        if(!_fc) return [];
-        var fMs=_timeToMs(document.getElementById(pref+'FromTime').value, _fc.allPts[0].time);
-        var tMs=_timeToMs(document.getElementById(pref+'ToTime').value,   _fc.allPts[0].time);
-        return _fc.allPts.filter(function(p){ var m=p.time.getTime(); return m>=fMs&&m<=tMs; });
-    }
-
-    // Map filter controls
-    function mfSyncTimeToStn(side){
-        if(!_fc)return;
-        var k=side==='from'?'From':'To';
-        var tEl=document.getElementById('mf'+k+'Time'), sEl=document.getElementById('mf'+k+'Stn');
-        var ms=_timeToMs(tEl.value, _fc.allPts[0].time);
-        var bi=-1,bd=Infinity;
-        for(var i=0;i<sEl.options.length;i++){var d=Math.abs(parseInt(sEl.options[i].value)-ms);if(d<bd){bd=d;bi=i;}}
-        if(bi>=0) sEl.selectedIndex=bi;
-    }
-    function mfSyncStnToTime(side){
-        if(!_fc)return;
-        var k=side==='from'?'From':'To';
-        var sEl=document.getElementById('mf'+k+'Stn'), tEl=document.getElementById('mf'+k+'Time');
-        if(sEl.value) tEl.value=_msToTimeStr(parseInt(sEl.value));
-    }
-    function mfApply(){
-        if(!_fc||!leafletMap)return;
-        var pts=_getFiltered('mf');
-        document.getElementById('mfPointCount').textContent=pts.length+' pts';
-        _rebuildMapPath(pts);
-    }
-    function mfReset(){
-        if(!_fc)return;
-        var pts=_fc.allPts;
-        document.getElementById('mfFromTime').value=_msToTimeStr(pts[0].time.getTime());
-        document.getElementById('mfToTime').value=_msToTimeStr(pts[pts.length-1].time.getTime());
-        _buildStnOptions(document.getElementById('mfFromStn'),pts,pts[0].time.getTime());
-        _buildStnOptions(document.getElementById('mfToStn'),pts,pts[pts.length-1].time.getTime());
-        mfApply();
-    }
-
-    // Graph filter controls
-    function gfSyncTimeToStn(side){
-        if(!_fc)return;
-        var k=side==='from'?'From':'To';
-        var tEl=document.getElementById('gf'+k+'Time'), sEl=document.getElementById('gf'+k+'Stn');
-        var ms=_timeToMs(tEl.value, _fc.allPts[0].time);
-        var bi=-1,bd=Infinity;
-        for(var i=0;i<sEl.options.length;i++){var d=Math.abs(parseInt(sEl.options[i].value)-ms);if(d<bd){bd=d;bi=i;}}
-        if(bi>=0) sEl.selectedIndex=bi;
-    }
-    function gfSyncStnToTime(side){
-        if(!_fc)return;
-        var k=side==='from'?'From':'To';
-        var sEl=document.getElementById('gf'+k+'Stn'), tEl=document.getElementById('gf'+k+'Time');
-        if(sEl.value) tEl.value=_msToTimeStr(parseInt(sEl.value));
-    }
-    function gfApply(){
-        if(!_fc)return;
-        var pts=_getFiltered('gf');
-        document.getElementById('gfPointCount').textContent=pts.length+' pts';
-        _drawChart(pts, _fc.sntMs, _fc.row);
-    }
-    function gfReset(){
-        if(!_fc)return;
-        var pts=_fc.allPts;
-        document.getElementById('gfFromTime').value=_msToTimeStr(pts[0].time.getTime());
-        document.getElementById('gfToTime').value=_msToTimeStr(pts[pts.length-1].time.getTime());
-        _buildStnOptions(document.getElementById('gfFromStn'),pts,pts[0].time.getTime());
-        _buildStnOptions(document.getElementById('gfToStn'),pts,pts[pts.length-1].time.getTime());
-        gfApply();
-    }
-
-    // ── Map path rebuild (keeps violation marker + FSD signals, rebuilds track) ──
-    var _trackLayer=null, _startMk=null, _endMk=null;
-    function _rebuildMapPath(pts) {
-        if(!leafletMap||!pts||pts.length<2)return;
-        if(_trackLayer){leafletMap.removeLayer(_trackLayer);_trackLayer=null;}
-        if(_startMk)   {leafletMap.removeLayer(_startMk);_startMk=null;}
-        if(_endMk)     {leafletMap.removeLayer(_endMk);_endMk=null;}
-        var ll=pts.filter(function(p){return p.lat&&p.lon;}).map(function(p){return[p.lat,p.lon];});
-        if(ll.length<2)return;
-        _trackLayer=L.polyline(ll,{color:'#3b82f6',weight:3,opacity:0.7,dashArray:'7,5'}).addTo(leafletMap);
-        var mkS=L.divIcon({html:'<div style="width:11px;height:11px;border-radius:50%;background:#10b981;border:2px solid #065f46;box-shadow:0 1px 4px rgba(0,0,0,0.3)"></div>',iconSize:[11,11],iconAnchor:[5,5]});
-        var mkE=L.divIcon({html:'<div style="width:11px;height:11px;border-radius:50%;background:#f97316;border:2px solid #9a3412;box-shadow:0 1px 4px rgba(0,0,0,0.3)"></div>',iconSize:[11,11],iconAnchor:[5,5]});
-        _startMk=L.marker(ll[0],{icon:mkS,zIndexOffset:200}).bindTooltip('▶ Start').addTo(leafletMap);
-        _endMk  =L.marker(ll[ll.length-1],{icon:mkE,zIndexOffset:200}).bindTooltip('■ End').addTo(leafletMap);
-        leafletMap.fitBounds(_trackLayer.getBounds(),{padding:[40,40]});
-    }
-
-    // ── Show KML button only when at least one row has per-sec data ──
-    function _updateKmlButton() {
-        var btn = document.getElementById('btnExportKML');
-        if (!btn) return;
-        var hasAny = analysisResults.some(function(_, idx) {
-            return perSecondData[idx] && perSecondData[idx].length > 0;
-        });
-        btn.style.display = hasAny ? 'inline-block' : 'none';
-    }
-
-        // ── Chart redraw (used by filter + openGraph) ──
-    function _drawChart(pts, sntMs, row) {
-        var speedLimit = parseFloat(document.getElementById('inputSpeedLimit').value)||63;
-        var labels=[], speeds=[], violIdx=-1, bd=Infinity;
-        pts.forEach(function(p,i){
-            labels.push(p.time.toLocaleTimeString());
-            speeds.push(!isNaN(p.speed)?p.speed:null);
-            var d=Math.abs(p.time.getTime()-sntMs);
-            if(d<bd){bd=d;violIdx=i;}
-        });
-
-        // ── Braking distance calculation (dynamic — recalculates on every filter change) ──
-        _brakingDistResult = _calcBrakingDist(pts, sntMs, violIdx);
-
-        var pc=speeds.map(function(s,i){return i===violIdx?'#ef4444':(s!==null&&s>speedLimit?'#f97316':'#3b82f6');});
-        var pr=speeds.map(function(s,i){return i===violIdx?8:3;});
-        var ll=speeds.map(function(){return speedLimit;});
-        var ctx=document.getElementById('speedChart').getContext('2d');
-        if(speedChartInstance){speedChartInstance.destroy();speedChartInstance=null;}
-        speedChartInstance=new Chart(ctx,{
-            type:'line',
-            data:{labels:labels,datasets:[
-                {label:'Speed (km/h)',data:speeds,borderColor:'#3b82f6',backgroundColor:'rgba(59,130,246,0.08)',
-                 borderWidth:2,pointBackgroundColor:pc,pointRadius:pr,pointHoverRadius:7,tension:0.3,fill:true,spanGaps:true},
-                {label:'Speed Limit ('+speedLimit+' km/h)',data:ll,borderColor:'#ef4444',
-                 borderWidth:2,borderDash:[8,4],pointRadius:0,fill:false}
-            ]},
-            options:{responsive:true,maintainAspectRatio:false,animation:{duration:300},
-                plugins:{
-                    legend:{position:'top',labels:{font:{size:11}}},
-                    tooltip:{callbacks:{afterLabel:function(c){return c.dataIndex===violIdx?'⚠ Signal: '+row.sigNo+' @ '+row.signalTime:'';}}}
-                },
-                scales:{
-                    x:{ticks:{maxTicksLimit:12,font:{size:10}},grid:{color:'#f1f5f9'}},
-                    y:{title:{display:true,text:'Speed (km/h)',font:{size:11}},min:0,
-                       suggestedMax:Math.max(speedLimit+20,(Math.max.apply(null,speeds.filter(Boolean))||0)+10),
-                       grid:{color:'#f1f5f9'}}
-                }
-            },
-            plugins:[
-                {id:'vLine',afterDraw:function(chart){
-                    if(violIdx<0||violIdx>=chart.data.labels.length)return;
-                    var meta=chart.getDatasetMeta(0);
-                    if(!meta.data[violIdx])return;
-                    var x=meta.data[violIdx].x,c=chart.ctx;
-                    c.save();c.beginPath();c.moveTo(x,chart.chartArea.top);c.lineTo(x,chart.chartArea.bottom);
-                    c.strokeStyle='rgba(239,68,68,0.7)';c.lineWidth=2;c.setLineDash([5,3]);c.stroke();
-                    c.fillStyle='#ef4444';c.font='bold 10px sans-serif';c.fillText('🚨 '+row.sigNo,x+4,chart.chartArea.top+14);
-                    c.restore();
-                }},
-                // ── Braking distance shaded region + label ──
-                {id:'brakingDist',afterDraw:function(chart){
-                    if(!_brakingDistResult)return;
-                    var vi=_brakingDistResult.violIdx, si=_brakingDistResult.stopIdx;
-                    var meta=chart.getDatasetMeta(0);
-                    if(!meta.data[vi]||!meta.data[si])return;
-                    var x1=meta.data[vi].x, x2=meta.data[si].x;
-                    if(x2<x1+2)x2=x1+2;
-                    var top=chart.chartArea.top, bot=chart.chartArea.bottom;
-                    var c=chart.ctx;
-                    c.save();
-                    // Orange-tinted shaded region between violation and stop/window-end
-                    c.fillStyle='rgba(251,146,60,0.13)';
-                    c.fillRect(x1,top,x2-x1,bot-top);
-                    // Right boundary dashed line (stop point or window end)
-                    c.strokeStyle='rgba(234,88,12,0.65)';c.lineWidth=1.5;c.setLineDash([4,3]);
-                    c.beginPath();c.moveTo(x2,top);c.lineTo(x2,bot);c.stroke();
-                    c.setLineDash([]);
-                    // Distance label pill
-                    var icon=_brakingDistResult.stoppedAtZero?'🛑 Stop':'→ End';
-                    var label=icon+': '+_brakingDistResult.distM+' m';
-                    c.font='bold 11px Arial';
-                    var tw=c.measureText(label).width+16;
-                    var midX=(x1+x2)/2, lx=Math.max(x1+2,midX-tw/2);
-                    if(lx+tw>chart.chartArea.right-4)lx=chart.chartArea.right-tw-6;
-                    var ly=top+56;
-                    // Pill background
-                    c.fillStyle='rgba(255,255,255,0.96)';
-                    c.strokeStyle='rgba(234,88,12,0.8)';c.lineWidth=1.5;
-                    c.beginPath();
-                    c.moveTo(lx+5,ly-14);c.lineTo(lx+tw-5,ly-14);
-                    c.arcTo(lx+tw,ly-14,lx+tw,ly-9,5);c.lineTo(lx+tw,ly+4);
-                    c.arcTo(lx+tw,ly+9,lx+tw-5,ly+9,5);c.lineTo(lx+5,ly+9);
-                    c.arcTo(lx,ly+9,lx,ly+4,5);c.lineTo(lx,ly-9);
-                    c.arcTo(lx,ly-14,lx+5,ly-14,5);c.closePath();
-                    c.fill();c.stroke();
-                    // Label text
-                    c.fillStyle='#c2410c';c.textAlign='left';
-                    c.fillText(label,lx+8,ly+2);
-                    c.restore();
-                }}
-            ]
-        });
-        // Braking distance entry in info bar
-        var brakingHtml = '';
-        if (_brakingDistResult) {
-            var _bdIcon  = _brakingDistResult.stoppedAtZero ? '🛑' : '→';
-            var _bdLabel = _brakingDistResult.stoppedAtZero ? 'Dist to stop' : 'Dist to window end';
-            brakingHtml = '<span style="background:#fff7ed;border:1px solid #fed7aa;border-radius:5px;padding:2px 9px;color:#c2410c;font-weight:700;font-size:0.78rem;">' +
-                _bdIcon + ' ' + _bdLabel + ': <b>' + _brakingDistResult.distM + ' m</b></span>';
-        }
-        document.getElementById('graphInfo').innerHTML =
-            '<span>🚂 Train: <b>'+row.trainNo+'</b></span>' +
-            '<span>📡 Signal: <b>'+row.sigNo+'</b> @ '+row.signalTime+'</span>' +
-            '<span>⚡ RTIS Speed: <b style="color:'+(row.speed>speedLimit?'#dc2626':'#16a34a')+'">'+row.speed+' km/h</b></span>' +
-            (row.speedPerSec!=null?'<span>🎯 Per-sec @ SNT: <b style="color:'+(row.speedPerSec>speedLimit?'#dc2626':'#16a34a')+'">'+row.speedPerSec+' km/h</b></span>':'') +
-            '<span>🏁 Limit: <b>'+speedLimit+' km/h</b></span>' +
-            '<span>📊 Points shown: <b>'+pts.length+'</b></span>' +
-            '<span>🔴 Red dot = violation moment</span>' +
-            brakingHtml;
-    }
-
-
-    // ════════════════════════════════════════════════════════════════
-    // KML EXPORT — Google Earth  (async, non-blocking)
-    // Three speed bands (green/amber/red), gx:Track for time-slider,
-    // colour-grouped LineStrings, no per-point placemark flood.
-    // ════════════════════════════════════════════════════════════════
+    
+    // Attach event handlers to window
+    window.mfSyncTimeToStn = function(side) { filterChart.mfSyncTimeToStn(side); };
+    window.mfSyncStnToTime = function(side) { filterChart.mfSyncStnToTime(side); };
+    window.mfApply = function() { 
+        filterChart.setupFilterChartContext(getLeafletMap(), speedChartInstance, null, analysisResults, perSecondData);
+        filterChart.mfApply(); 
+    };
+    window.mfReset = function() { filterChart.mfReset(); };
+    window.gfSyncTimeToStn = function(side) { filterChart.gfSyncTimeToStn(side); };
+    window.gfSyncStnToTime = function(side) { filterChart.gfSyncStnToTime(side); };
+    window.gfApply = function() { filterChart.gfApply(); };
+    window.gfReset = function() { filterChart.gfReset(); };
 
     // ══════════════════════════════════════════════════════════════
     // KML EXPORT SYSTEM (Extracted to src/ui/kml-export.js)
@@ -1989,4 +1210,5 @@ window.generateAllPdfs = generateAllPdfs;
 window.kmlSelectAll = kmlSelectAll;
 window.closeKmlDialog = closeKmlDialog;
 window.generateSelectedKML = generateSelectedKML;
-
+window.closeDriveUploadDialog = closeDriveUploadDialog;
+window.startDriveUpload = startDriveUpload;

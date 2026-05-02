@@ -7,6 +7,7 @@ import { jsPDF } from 'jspdf';
 
 // Module-level state (mirrors _pdfViolations in main.js)
 var _pdfViolations = [];
+var _generatedPdfs = [];   // [{ blob, filename }] — collected after generation for optional Drive upload
 
 // ── Public entry: open dialog ─────────────────────────────────
 export function openPdfDialog(analysisResults) {
@@ -14,13 +15,19 @@ export function openPdfDialog(analysisResults) {
 
     _pdfViolations = analysisResults.filter(function(r) {
         var isViol    = r.resultClass === 'violation' || r.resultClass === 'violation-multi';
+        var isAmbig   = r.resultClass === 'ambiguous';
         var hasPerSec = r.speedPerSec !== null && r.speedPerSec !== undefined;
         var isRedSpeed = hasPerSec && r.speedPerSec > speedLimit;
-        return isViol && isRedSpeed;
+        if ((isViol || isAmbig) && isRedSpeed) {
+            // Tag source tab for color-coding in the dialog
+            r._pdfSource = isViol ? 'violation' : 'ambiguous';
+            return true;
+        }
+        return false;
     });
 
     if (!_pdfViolations.length) {
-        alert('No violations with per-second GPS data showing over-speed found.\n\nUpload per-second CSV files for violation rows first, then try again.');
+        alert('No violations with per-second GPS data showing over-speed found.\n\nUpload per-second CSV files for violation/ambiguous rows first, then try again.');
         return;
     }
 
@@ -32,9 +39,16 @@ export function openPdfDialog(analysisResults) {
         var overSpeed = Math.max(0, violSpeed - speedLimit).toFixed(1);
         var dirLabel  = row.direction || row.dirTrain || row.dirSig || '—';
 
+        // Color-code by source: red for violation, amber for ambiguous
+        var isFromAmbig = row._pdfSource === 'ambiguous';
+        var badgeBg     = isFromAmbig ? '#f59e0b' : '#dc2626';   // amber vs red
+        var borderColor = isFromAmbig ? '#fbbf24' : '#fca5a5';
+        var shadowColor = isFromAmbig ? 'rgba(245,158,11,0.08)' : 'rgba(153,27,27,0.08)';
+        var sourceLabel = isFromAmbig ? 'AMBIGUOUS' : 'VIOLATION';
+
         // Outer card wrapper
         var card = document.createElement('div');
-        card.style.cssText = 'border:1.5px solid #fca5a5;border-radius:10px;background:white;box-shadow:0 2px 8px rgba(153,27,27,0.08);overflow:visible;';
+        card.style.cssText = 'border:1.5px solid ' + borderColor + ';border-radius:10px;background:white;box-shadow:0 2px 8px ' + shadowColor + ';overflow:visible;';
         card.setAttribute('data-vi', vi);
 
         // ── Accordion header (clickable) ──
@@ -42,7 +56,8 @@ export function openPdfDialog(analysisResults) {
         hdr.style.cssText = 'background:linear-gradient(90deg,#1e3a5f 0%,#1e40af 100%);padding:11px 16px;display:flex;justify-content:space-between;align-items:center;cursor:pointer;border-radius:8px;transition:border-radius 0.2s;user-select:none;';
         hdr.innerHTML =
             '<div style="display:flex;align-items:center;gap:10px;">' +
-                '<span style="background:#dc2626;color:white;font-size:0.7rem;font-weight:700;padding:2px 7px;border-radius:4px;">#' + (vi+1) + '</span>' +
+                '<span style="background:' + badgeBg + ';color:white;font-size:0.7rem;font-weight:700;padding:2px 7px;border-radius:4px;">#' + (vi+1) + '</span>' +
+                '<span style="background:' + (isFromAmbig ? 'rgba(245,158,11,0.2)' : 'rgba(220,38,38,0.2)') + ';color:' + (isFromAmbig ? '#fbbf24' : '#fca5a5') + ';font-size:0.6rem;font-weight:700;padding:1px 6px;border-radius:3px;letter-spacing:0.05em;">' + sourceLabel + '</span>' +
                 '<span style="color:white;font-weight:700;font-size:0.9rem;">Train ' + row.trainNo + '</span>' +
                 '<span style="color:#93c5fd;font-size:0.78rem;">Loco ' + (row.loco||'—') + '</span>' +
             '</div>' +
@@ -209,7 +224,7 @@ export function pdfExpandAll(open) {
     });
 }
 
-export async function generateAllPdfs(analysisResults, _captureMapForRow, _captureChartForRow, _reportProgress) {
+export async function generateAllPdfs(analysisResults, _captureMapForRow, _captureChartForRow, _reportProgress, _onPdfsGenerated) {
     if (!_pdfViolations.length) return;
 
     var container = document.getElementById('pdfViolationCards');
@@ -240,6 +255,7 @@ export async function generateAllPdfs(analysisResults, _captureMapForRow, _captu
 
     var speedLimit = parseFloat(document.getElementById('inputSpeedLimit').value) || 63;
     var total = activeVis.length;
+    _generatedPdfs = [];   // reset for this batch
 
     for (var i = 0; i < total; i++) {
         var vi  = activeVis[i];
@@ -265,13 +281,22 @@ export async function generateAllPdfs(analysisResults, _captureMapForRow, _captu
 
         var trainDate   = lpData[vi].trainDate;
         var journeyDate = lpData[vi].journeyDate;
-        await _buildSinglePdf(row, speedLimit, trainNoEdited, lpName, lpHQ, lpCLI, trainDate, journeyDate, remarks, mapDataUrl, chartDataUrl);
+        var pdfResult = await _buildSinglePdf(row, speedLimit, trainNoEdited, lpName, lpHQ, lpCLI, trainDate, journeyDate, remarks, mapDataUrl, chartDataUrl);
+        if (pdfResult) _generatedPdfs.push(pdfResult);
     }
 
     _reportProgress('Done! ' + total + ' PDF(s) generated.', 100);
-    await new Promise(function(r){ setTimeout(r, 1800); });
+    await new Promise(function(r){ setTimeout(r, 1200); });
     modal.style.display = 'none';
+
+    // Notify caller that PDFs are ready (for optional Google Drive upload)
+    if (_onPdfsGenerated && _generatedPdfs.length > 0) {
+        _onPdfsGenerated(_generatedPdfs);
+    }
 }
+
+// ── Getter for generated PDFs ────────────────────────────────
+export function getGeneratedPdfs() { return _generatedPdfs; }
 
 // ── Private: build and save one PDF ──────────────────────────
 async function _buildSinglePdf(row, speedLimit, trainNoEdited, lpName, lpHQ, lpCLI, trainDate, journeyDate, remarks, mapDataUrl, chartDataUrl) {
@@ -360,7 +385,7 @@ async function _buildSinglePdf(row, speedLimit, trainNoEdited, lpName, lpHQ, lpC
     doc.text('Railway Signal Violation Dashboard  |  Confidential  |  ' + today, mg, H - 5.5);
     doc.text('Page 1 of 1', W - mg, H - 5.5, { align: 'right' });
 
-    // ── Save ──
+    // ── Save (auto-download) + collect for Drive upload ──
     function _safe(val, fb) {
         return String(val||fb||'NA').trim().replace(/[^a-zA-Z0-9]/g,'_').replace(/_+/g,'_').replace(/^_|_$/g,'')||'NA';
     }
@@ -372,15 +397,21 @@ async function _buildSinglePdf(row, speedLimit, trainNoEdited, lpName, lpHQ, lpC
             return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
         } catch(e){ return new Date().toISOString().slice(0,10); }
     })();
-    doc.save(
+    var _filename =
         'Violation_' + _safe(trainNoEdited) +
         '_' + _safe(row.loco) +
         '_' + _safe(lpName,'NA') +
         '_' + _safe(lpHQ,'NA') +
         '_' + _safe(String(row.station).split(/[\s\u2192\->]+/)[0]) +
         '_' + _safe(row.sigNo) +
-        '_' + _violDate + '.pdf'
-    );
+        '_' + _violDate + '.pdf';
+
+    // Always auto-download
+    doc.save(_filename);
+
+    // Also return blob + filename for optional Drive upload
+    var pdfBlob = doc.output('blob');
+    return { blob: pdfBlob, filename: _filename };
 }
 
 // ── Private: PDF helpers ──────────────────────────────────────

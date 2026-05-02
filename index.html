@@ -73,7 +73,7 @@
                 <div class="space-y-3">
                     <div>
                         <label class="block text-sm font-medium">Time Window (seconds)</label>
-                        <input type="number" id="inputTimeWindow" value="120" class="w-full border rounded p-2" title="Train must pass 0-120 seconds BEFORE signal event">
+                        <input type="number" id="inputTimeWindow" value="60" class="w-full border rounded p-2" title="Train must pass 0-60 seconds BEFORE signal event">
                         <p class="text-xs text-gray-500 mt-1">Train passes first, then signal logs</p>
                     </div>
                     <div>
@@ -81,8 +81,8 @@
                         <input type="number" id="inputSpeedLimit" value="60" class="w-full border rounded p-2">
                     </div>
                     <div>
-                        <label class="block text-sm font-medium">Max Dist (km)</label>
-                        <input type="number" id="inputMaxDist" value="0.2" step="0.01" class="w-full border rounded p-2">
+                        <label class="block text-sm font-medium">Max Dist (m)</label>
+                        <input type="number" id="inputMaxDist" value="100" step="1" min="0" class="w-full border rounded p-2">
                     </div>
                     <div>
                         <label class="block text-sm font-medium">FSD Dist Threshold (m)
@@ -507,6 +507,41 @@
                 <div style="display:flex;gap:10px;">
                     <button onclick="closeKmlDialog()" style="background:#f1f5f9;border:1px solid #e2e8f0;color:#475569;font-weight:600;padding:9px 20px;border-radius:7px;cursor:pointer;font-size:0.85rem;">Cancel</button>
                     <button id="kmlGenerateBtn" onclick="generateSelectedKML()" disabled style="background:linear-gradient(135deg,#0891b2,#0e7490);border:none;color:white;font-weight:700;padding:9px 24px;border-radius:7px;cursor:pointer;font-size:0.85rem;opacity:0.45;box-shadow:0 2px 8px rgba(8,145,178,0.35);">🌍 Generate KML</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Google Identity Services (for Drive upload) -->
+    <script src="https://accounts.google.com/gsi/client" async defer></script>
+
+    <!-- Google Drive Upload Modal -->
+    <div id="driveUploadModal" style="display:none;position:fixed;inset:0;z-index:99999;background:rgba(15,23,42,0.75);backdrop-filter:blur(3px);align-items:center;justify-content:center;">
+        <div style="background:#f8fafc;border-radius:14px;width:100%;max-width:600px;margin:0 auto;box-shadow:0 30px 80px rgba(0,0,0,0.45);overflow:hidden;display:flex;flex-direction:column;">
+            <!-- Header -->
+            <div style="background:linear-gradient(135deg,#1d4ed8 0%,#2563eb 100%);padding:16px 22px;display:flex;justify-content:space-between;align-items:center;flex-shrink:0;">
+                <div>
+                    <div style="color:white;font-size:1.05rem;font-weight:700;display:flex;align-items:center;gap:10px;">
+                        📤 Upload to Google Drive
+                    </div>
+                    <div style="color:#bfdbfe;font-size:0.75rem;margin-top:3px;">PDFs downloaded successfully · select files to also upload to shared Drive folder</div>
+                </div>
+                <button onclick="closeDriveUploadDialog()" style="background:rgba(255,255,255,0.15);border:none;color:white;font-size:1.1rem;width:32px;height:32px;border-radius:50%;cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0;">✕</button>
+            </div>
+            <!-- Select All -->
+            <div style="padding:10px 20px;border-bottom:1px solid #e2e8f0;background:white;display:flex;align-items:center;gap:10px;">
+                <input type="checkbox" id="driveSelectAll" checked style="width:16px;height:16px;accent-color:#1d4ed8;cursor:pointer;">
+                <label for="driveSelectAll" style="font-size:0.82rem;font-weight:600;color:#475569;cursor:pointer;">Select All</label>
+                <span style="margin-left:auto;font-size:0.72rem;color:#94a3b8;" id="driveUploadStatus">Ready to upload</span>
+            </div>
+            <!-- File List -->
+            <div id="driveFileList" style="max-height:45vh;overflow-y:auto;"></div>
+            <!-- Footer -->
+            <div style="padding:13px 20px;border-top:1px solid #e2e8f0;display:flex;justify-content:space-between;align-items:center;background:white;flex-shrink:0;">
+                <span style="font-size:0.72rem;color:#94a3b8;">Files are uploaded to the shared Google Drive folder</span>
+                <div style="display:flex;gap:10px;">
+                    <button onclick="closeDriveUploadDialog()" style="background:#f1f5f9;border:1px solid #e2e8f0;color:#475569;font-weight:600;padding:9px 20px;border-radius:7px;cursor:pointer;font-size:0.85rem;">Skip</button>
+                    <button id="driveUploadBtn" onclick="startDriveUpload()" style="background:linear-gradient(135deg,#1d4ed8,#2563eb);border:none;color:white;font-weight:700;padding:9px 24px;border-radius:7px;cursor:pointer;font-size:0.85rem;box-shadow:0 2px 8px rgba(29,78,216,0.35);">📤 Upload Selected</button>
                 </div>
             </div>
         </div>

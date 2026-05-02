@@ -122,3 +122,31 @@ export function cleanStationName(station) {
     if (!match || !match[1]) return null;
     return match[1];
 }
+
+export function calcBrakingDist(pts, sntMs, violIdx) {
+    if (!pts || !pts.length || violIdx < 0) return null;
+    var winStart = pts[0].time.getTime();
+    var winEnd   = pts[pts.length - 1].time.getTime();
+    // Violation point must be inside the current window
+    if (sntMs < winStart || sntMs > winEnd) return null;
+
+    var totalDist = 0;
+    var stopIdx = pts.length - 1; // default: end of window
+    var stoppedAtZero = false;
+
+    for (var i = violIdx; i < pts.length; i++) {
+        var p = pts[i];
+        // Accumulate per-second distance increment
+        if (p.distFromSpeed !== null && p.distFromSpeed !== undefined && !isNaN(p.distFromSpeed)) {
+            totalDist += p.distFromSpeed;
+        }
+        // Stop at first point where speed drops below 1 km/h
+        // (some RTIS devices never report exact 0 — values like 0.23, 0.89 are effectively stopped)
+        if (!isNaN(p.speed) && p.speed < 1) {
+            stopIdx = i;
+            stoppedAtZero = true;
+            break;
+        }
+    }
+    return { distM: Math.round(totalDist), violIdx: violIdx, stopIdx: stopIdx, stoppedAtZero: stoppedAtZero };
+}
