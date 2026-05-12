@@ -102,6 +102,24 @@ export function handlePerSecFile(event, rowIdx, _onDone, ctx) {
 
                 var match = matchPerSecToSNT(parsedData, sntDateObj);
 
+                // RETAIN ONLY 500 POINTS AROUND VIOLATION (to prevent browser hang)
+                // 500 points = ~8.3 mins of 1-sec data, plenty for graph/map ±3 min views
+                if (match.quality !== 'none' && parsedData.length > 500) {
+                    var bestIdx = match.idx;
+                    var halfWindow = 250;
+                    var start = Math.max(0, bestIdx - halfWindow);
+                    var end = Math.min(parsedData.length, bestIdx + halfWindow + 1);
+                    var slicedData = parsedData.slice(start, end);
+                    
+                    // Update match idx to refer to the new sliced array
+                    match.idx = bestIdx - start;
+                    
+                    // Update the state with truncated data
+                    ctx.perSecondData[rowIdx] = slicedData;
+                    parsedData = slicedData; 
+                    ctx.log("✂️ Truncated per-sec data to 500 points around violation (was " + results.data.length + ")");
+                }
+
                 // Store match result on the row object
                 row.perSecMatch = match;
 
